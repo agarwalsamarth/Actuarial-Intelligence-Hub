@@ -37,7 +37,7 @@ money_keywords = ["loss", "premium", "amount", "cost", "ibnr", "ult", "total", "
 vanna_api_key = st.secrets["vanna_api_key"]
 vanna_model_name = st.secrets["vanna_model_name"]
 vn_model = VannaDefault(model=vanna_model_name, api_key=vanna_api_key)
-vn_model.connect_to_sqlite('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
+vn_model.connect_to_sqlite('Actuarial_Data.db')
 
 # ---- Config ----
 serpapi_key = st.secrets["SERPAPI_API_KEY"]
@@ -134,7 +134,7 @@ def prune_state(state: GraphState, exclude: List[str]) -> dict:
 class RouterNode(Runnable):
     def invoke(self, state: GraphState, config=None) -> GraphState:
         doc_flag = "yes" if state['doc_loaded'] else "no"
-        schema = get_schema_description('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
+        schema = get_schema_description('Actuarial_Data.db')
 
         router_prompt = f"""
         You are an intelligent routing agent. Your job is to:
