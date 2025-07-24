@@ -164,7 +164,13 @@ class RouterNode(Runnable):
 
         4. If the route is "sql" or "search", DO NOT include vanna_prompt or fuzzy_prompt.
 
-        5. "comp" if the user is explicitly asking to compare internal data with external insights 
+        5. If the route is "sql", include vanna_prompt, but don't include fuzzy_prompt
+        -(eg: User Prompt is "Show me exposure year wise incurred loss and plot a graph", then 
+        -vanna_prompt will be "Shoe me exposure year wise incurred loss".
+        -Your work is to remove the noise and focus only on things that are required to generate sql query from vanna. SO remove all the extra stuffs out of the user prompt.
+
+
+        6. "comp" if the user is explicitly asking to compare internal data with external insights 
         -(e.g.,User Prompt is "Compare IBNR trends with industry benchmarks for exposure year 2025 ")
         - Return Vanna_prompt as well as "Show IBNR trends for exposure year 2025"
         -Do not include fuzzy_prompt
@@ -178,6 +184,7 @@ class RouterNode(Runnable):
         For SQL:
         {{
             "route": "sql"
+            "vanna_prompt": "Show IBNR trends for exposure year 2025",
         }}
 
         For Document:
@@ -219,10 +226,13 @@ class RouterNode(Runnable):
             parsed = {"route": "search"}
 
         # ✅ Enforce safety: remove vanna_prompt if not 'document' or 'comp'
-        if parsed.get("route") not in ["document", "comp"]:
+        if parsed.get("route") not in ["document", "comp", "sql"]:
             parsed["vanna_prompt"] = None
             parsed["fuzzy_prompt"] = None
 
+        # ✅ Define chart_info only if needed
+        chart_info = None
+        
         return {
             **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
             "route": parsed.get("route"),
@@ -311,7 +321,7 @@ def plot_chart(df: pd.DataFrame, chart_info: dict):
 
 def vanna_node(state: GraphState) -> GraphState:
     # Use user_prompt if vanna_prompt is not available
-    prompt = state["user_prompt"]
+    prompt = state["vanna_prompt"]
 
     sql_query = vn_model.generate_sql(prompt)
 
@@ -1087,7 +1097,6 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     ppt_buffer = generate_ppt(entry)
     st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
-
 
 
 
