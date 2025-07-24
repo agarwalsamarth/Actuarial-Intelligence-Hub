@@ -100,7 +100,7 @@ def get_schema_description(db_path: str) -> str:
     return schema_str.strip()
 
 def load_qs_pairs():
-    with open("vanna_advanced_sql_pairs.txt", "r") as f:
+    with open("/Users/hp/OneDrive/Desktop/Python/Agentic AI - Vanna_Serp_Doc/vanna_advanced_sql_pairs.txt", "r") as f:
         text = f.read()
     pairs = re.findall(r'question="(.*?)",\s*sql="""(.*?)"""', text, re.DOTALL)
     return [{"question": q.strip(), "sql": s.strip()} for q, s in pairs]
@@ -134,7 +134,7 @@ def prune_state(state: GraphState, exclude: List[str]) -> dict:
 class RouterNode(Runnable):
     def invoke(self, state: GraphState, config=None) -> GraphState:
         doc_flag = "yes" if state['doc_loaded'] else "no"
-        schema = get_schema_description('Actuarial_Data.db')
+        schema = get_schema_description('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
 
         router_prompt = f"""
         You are an intelligent routing agent. Your job is to:
@@ -637,6 +637,115 @@ def visualize_workflow(builder, active_route=None):
     plt.tight_layout()
     st.pyplot(plt)
 
+
+#Exporting data to Powerpoint
+def generate_ppt(entry) -> BytesIO:
+    prs = Presentation()
+    layout = prs.slide_layouts[5]  # title + content
+
+    # 🧠 Title Slide
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.title.text = "Agentic AI Report"
+    slide.placeholders[1].text = f"Prompt: {entry['prompt']}"
+
+    route = entry.get("route")
+
+    # 🧾 SQL Query Slide (if applicable)
+    if route in ["sql", "document", "comp"] and entry.get("sql_query"):
+        slide = prs.slides.add_slide(layout)
+        slide.shapes.title.text = "SQL Query"
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5))
+        tf = box.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.text = entry["sql_query"]
+        p.font.size = Pt(14)
+
+    # 📊 SQL Result Table (if applicable)
+    result = entry.get("result")
+    if isinstance(result, list):
+        result = pd.DataFrame(result)
+
+    if route in ["sql", "document", "comp"] and isinstance(result, pd.DataFrame) and not result.empty:
+        df = pd.DataFrame(entry["result"]) if isinstance(entry["result"], list) else entry["result"]
+        if isinstance(df, pd.DataFrame):
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = "SQL Results"
+            rows = min(6, len(df) + 1)
+            cols = len(df.columns)
+            table = slide.shapes.add_table(rows, cols, Inches(0.5), Inches(1.2), Inches(8.5), Inches(3)).table
+            for i, col in enumerate(df.columns):
+                table.cell(0, i).text = str(col)
+            for i, row in df.head(5).iterrows():
+                for j, val in enumerate(row):
+                    table.cell(i + 1, j).text = str(val)
+
+    # 🆚 Comparison Summary
+    if route == "comp" and entry.get("comparison_summary"):
+        slide = prs.slides.add_slide(layout)
+        slide.shapes.title.text = "Comparison Summary"
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5))
+        tf = box.text_frame
+        tf.word_wrap = True
+        for para in entry["comparison_summary"].split("\n"):
+            if para.strip():
+                p = tf.add_paragraph()
+                p.text = para.strip()
+                p.font.size = Pt(14)
+                p.space_after = Pt(4)
+
+    # 🧠 General Summary (Search + Comp)
+    if route in ["search", "comp"] and entry.get("general_summary"):
+        slide = prs.slides.add_slide(layout)
+        slide.shapes.title.text = "General Summary"
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5))
+        tf = box.text_frame
+        tf.word_wrap = True
+        for para in entry["general_summary"].split("\n"):
+            if para.strip():
+                p = tf.add_paragraph()
+                p.text = para.strip()
+                p.font.size = Pt(14)
+                p.space_after = Pt(4)
+
+    # 🔗 Top Web Links (Search + Comp)
+    if route in ["search", "comp"] and entry.get("web_links"):
+        slide = prs.slides.add_slide(layout)
+        slide.shapes.title.text = "Top Web Links"
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5))
+        tf = box.text_frame
+        tf.word_wrap = True
+
+        for i, (link_md, summary) in enumerate(entry["web_links"], 1):
+            # Match Markdown-style link: [Title](https://link)
+            match = re.match(r"\[(.*?)\]\((.*?)\)", link_md)
+            if match:
+                title, url = match.groups()
+            else:
+                title, url = f"Link {i}", link_md  # fallback
+
+            # Add hyperlink paragraph
+            p = tf.add_paragraph()
+            run = p.add_run()
+            run.text = f"{i}. {title}"
+            run.font.size = Pt(13)
+            run.hyperlink.address = url
+            p.space_after = Pt(2)
+
+            # Add summary (not a hyperlink)
+            summary_p = tf.add_paragraph()
+            summary_p.text = f"    ↳ {summary[:180]}..."
+            summary_p.font.size = Pt(12)
+            summary_p.space_after = Pt(6)
+
+    # Finalize PPT in memory
+    ppt_bytes = BytesIO()
+    prs.save(ppt_bytes)
+    ppt_bytes.seek(0)
+    return ppt_bytes
+
+
+
 # ---- LangGraph Setup ----
 graph_builder = StateGraph(GraphState)
 graph_builder.add_node("router", RouterNode())
@@ -884,6 +993,8 @@ if st.session_state.active_chat_index is None:
                 for q in followups:
                     st.markdown(f"- 👉 {q}")
 
+            st.download_button("⬇️ Export to PPT", generate_ppt(chat_entry), file_name="agentic_ai_output.pptx")
+
             st.session_state.just_ran_agent = False
             st.session_state.active_chat_index = None
 
@@ -967,5 +1078,10 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
         for i, (link, summary) in enumerate(web_links or [], 1):
             st.markdown(f"**{i}.** {link}")
             st.markdown(f"_Summary:_\n{summary}")
+
+    ppt_buffer = generate_ppt(entry)
+    st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
+
+
 
 
