@@ -100,7 +100,7 @@ def get_schema_description(db_path: str) -> str:
     return schema_str.strip()
 
 def load_qs_pairs():
-    with open("/Users/hp/OneDrive/Desktop/Python/Agentic AI - Vanna_Serp_Doc/vanna_advanced_sql_pairs.txt", "r") as f:
+    with open("vanna_advanced_sql_pairs.txt", "r") as f:
         text = f.read()
     pairs = re.findall(r'question="(.*?)",\s*sql="""(.*?)"""', text, re.DOTALL)
     return [{"question": q.strip(), "sql": s.strip()} for q, s in pairs]
@@ -134,7 +134,7 @@ def prune_state(state: GraphState, exclude: List[str]) -> dict:
 class RouterNode(Runnable):
     def invoke(self, state: GraphState, config=None) -> GraphState:
         doc_flag = "yes" if state['doc_loaded'] else "no"
-        schema = get_schema_description('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
+        schema = get_schema_description('Actuarial_Data.db')
 
         router_prompt = f"""
         You are an intelligent routing agent. Your job is to:
