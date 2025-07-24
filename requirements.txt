@@ -31,6 +31,8 @@ python-dotenv
 matplotlib==3.10.3
 networkx==3.5
 
+#Powerpoint
+python-pptx
 
 # Optional: Uncomment if you face Pydantic-related issues
 # pydantic<2
