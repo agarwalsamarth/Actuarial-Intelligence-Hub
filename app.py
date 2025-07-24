@@ -44,7 +44,7 @@ serpapi_key = st.secrets["SERPAPI_API_KEY"]
 
 # ---Open AI LLM---
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"]
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 def call_llm(prompt: str) -> str:
     try:
