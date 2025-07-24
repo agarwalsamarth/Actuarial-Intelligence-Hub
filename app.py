@@ -22,6 +22,12 @@ from io import BytesIO
 from datetime import datetime
 import json
 from datetime import date, timedelta
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.dml.color import RGBColor
+import io
+
 
 st.set_page_config(layout="wide")
 
