@@ -1,50 +1,4 @@
 # Streamlit + LangGraph Agentic AI App
-#To be added
-##Vanna vs External doc
-##Summary with web links
-#History logs
-#More agentic frontend
-#Few shot prompting for all nodes
-#Adding charts for vanna
-
-
-# Queries:
-# Comp: Compare the Incurred loss with AXA XL competitors for last 5 years
-# Vanna: Show me exposure year wise Incurred loss and plot a pie chart
-# Search: What are the expected losses due to recent wars
-
-
-# Things we covered since last wednesday:
-# 1. Comp Node: 1. Added a comp node to compare the internal data (vanna) with external docs/competitors (serp).
-#               2. It will show SQL_Query, SQL output table, General summary, web links, Final Comparing summary  
-# 2. Serp Node: Added a general summary along with links. And also a short summary of each of the link.
-# 3. Vanna Node: 1. Added a SQl_Query to be printed along with SQL result/table. 
-#                2. If a user asks to plot a chart, chart will be printed. If user explicitly mentioned any specific type 
-#                   of chart then it will override the LLM's predicted chart. 
-# 4. History logs: 1. Added all the chats in form of history with a time stamp. 
-#                  2. Removed the user input text box and the "run agent" button when user view any historical tab,
-#                     and new button is provided when user wants to ask a new query.
-# 5. Routes Visualization Chart: Added new Comp node in the Route workflow chart.
-
-
-#TO DO
-# 1 Hit on enter instead of Run agent button : Done
-# 2 Vanna output values to accounting format : Done
-# 3 Comp node prompt optimize : Done
-# 4 Fetch numerical numbers as well in Serp node : Done
-# 5 few shots prompting wherever possible
-# 6 follow up questions on historical tabs
-# 7 suggest next possible questions by llm : Done
-# 8 Same session multiple questions/ new session
-# 9. Move route chart from center to right : Done
-# 10. Document Node
-# DATA on priority
-#11: LR
-#12: Export PPT
-#AvE
-#impact of infllation(loss)
-#
-#Host on streamlit cloud
 
 import streamlit as st
 from langgraph.graph import StateGraph, END
@@ -73,26 +27,24 @@ st.set_page_config(layout="wide")
 
 load_dotenv()
 
-os.environ["LANGCHAIN_TRACING_V2"]="true"
-os.environ["LANGCHAIN_API_KEY"]=os.getenv("LANGCHAIN_API_KEY")
+#os.environ["LANGCHAIN_TRACING_V2"]="true"
+#os.environ["LANGCHAIN_API_KEY"]=os.getenv("LANGCHAIN_API_KEY")
 
 # Keywords that usually indicate monetary columns
 money_keywords = ["loss", "premium", "amount", "cost", "ibnr", "ult", "total", "claim", "reserve", "payment"]
 
 # ---- Vanna Setup ----
-vanna_api_key = os.getenv("vanna_api_key")
-vanna_model_name = os.getenv("vanna_model_name")
+vanna_api_key = st.secrets["vanna_api_key"]
+vanna_model_name = st.secrets["vanna_model_name"]
 vn_model = VannaDefault(model=vanna_model_name, api_key=vanna_api_key)
 vn_model.connect_to_sqlite('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
 
 # ---- Config ----
-#openai.api_key = os.getenv("TOGETHER_API_KEY")
-#openai.base_url = "https://api.together.xyz"
-serpapi_key = os.getenv("SERPAPI_API_KEY")
+serpapi_key = st.secrets["SERPAPI_API_KEY"]
 
 # ---Open AI LLM---
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"]
 
 def call_llm(prompt: str) -> str:
     try:
