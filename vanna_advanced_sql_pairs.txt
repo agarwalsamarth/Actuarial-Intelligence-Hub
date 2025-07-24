@@ -1,0 +1,104 @@
+vn_model.train(
+    question="Which claims have a loss ratio greater than the average across all claims?",
+    sql="""
+    SELECT *
+    FROM PnC_Data
+    WHERE "Loss Ratio" > (
+        SELECT AVG("Loss Ratio") FROM PnC_Data
+    );
+    """
+)
+
+vn_model.train(
+    question="For each reserve class, what is the deviation of each record’s paid loss from the class average?",
+    sql="""
+    WITH ClassAvg AS (
+        SELECT "Reserve Class", AVG("Paid Loss") AS avg_paid
+        FROM PnC_Data
+        GROUP BY "Reserve Class"
+    )
+    SELECT p.*, 
+           (p."Paid Loss" - c.avg_paid) AS DeviationFromClassAvg
+    FROM PnC_Data p
+    JOIN ClassAvg c ON p."Reserve Class" = c."Reserve Class";
+    """
+)
+
+vn_model.train(
+    question="Rank the top 3 ultimate loss records within each branch.",
+    sql="""
+    SELECT *
+    FROM (
+        SELECT *, 
+               RANK() OVER (PARTITION BY "Branch" ORDER BY "Ultimate Loss" DESC) AS rnk
+        FROM PnC_Data
+    ) ranked
+    WHERE rnk <= 3;
+    """
+)
+
+vn_model.train(
+    question="Categorize each record based on loss ratio bands (High, Medium, Low).",
+    sql="""
+    SELECT *,
+           CASE 
+               WHEN "Loss Ratio" >= 1.2 THEN 'High'
+               WHEN "Loss Ratio" BETWEEN 0.8 AND 1.2 THEN 'Medium'
+               ELSE 'Low'
+           END AS LossBand
+    FROM PnC_Data;
+    """
+)
+
+vn_model.train(
+    question="Calculate year-over-year change in earned premium by underwriting year.",
+    sql="""
+    SELECT "Underwriting Year",
+           SUM("Earned Premium") AS EarnedThisYear,
+           LAG(SUM("Earned Premium")) OVER (ORDER BY "Underwriting Year") AS EarnedLastYear,
+           SUM("Earned Premium") - LAG(SUM("Earned Premium")) OVER (ORDER BY "Underwriting Year") AS YoYChange
+    FROM PnC_Data
+    GROUP BY "Underwriting Year";
+    """
+)
+
+vn_model.train(
+    question="Find records where IBNR is negative or paid loss exceeds ultimate loss (potential data issue).",
+    sql="""
+    SELECT *
+    FROM PnC_Data
+    WHERE "IBNR" < 0 OR "Paid Loss" > "Ultimate Loss";
+    """
+)
+
+vn_model.train(
+    question="Compare each record’s loss ratio to the average for its RI Type.",
+    sql="""
+    SELECT *,
+           "Loss Ratio" - AVG("Loss Ratio") OVER (PARTITION BY "RI Type") AS DeltaFromRITypeAvg
+    FROM PnC_Data;
+    """
+)
+
+vn_model.train(
+    question="What is the average gap between budgeted and actual losses per reserve class and loss type?",
+    sql="""
+    SELECT "Reserve Class", "Loss Type",
+           AVG("Budget Loss" - "Ultimate Loss") AS AvgLossDelta
+    FROM PnC_Data
+    GROUP BY "Reserve Class", "Loss Type";
+    """
+)
+
+
+)
+
+vn_model.train(
+    question="Join with a Branch_Info table to get the region name for each record.",
+    sql="""
+    SELECT p.*, b.RegionName
+    FROM PnC_Data p
+    JOIN Branch_Info b ON p."Branch" = b.BranchCode;
+    """
+)
+
