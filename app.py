@@ -184,7 +184,7 @@ class RouterNode(Runnable):
         For SQL:
         {{
             "route": "sql"
-            "vanna_prompt": "Show IBNR trends for exposure year 2025",
+            "vanna_prompt": "Show IBNR trends for exposure year 2025"
         }}
 
         For Document:
