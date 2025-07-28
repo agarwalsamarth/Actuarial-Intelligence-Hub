@@ -116,6 +116,28 @@ qs_examples = "\n".join(
     f"Q: {pair['question']}\nSQL: {pair['sql']}" for pair in QSPairs[:7]  # Limit to 7 to avoid token overflow
 )
 
+documentation = """
+PnC_Data Table:
+- Reserve Class contains insurance business lines such as 'Property', 'Casualty', 'Marine', 'Motor', etc.
+- Exposure Year refers to the year in which the insured risk was exposed to potential loss.
+- RI Type identifies whether the record is 'Gross' or one of the reinsurance types such as 'Ceded - XOL', 'Ceded - QS', 'Ceded - CAP', 'Ceded - FAC', or 'Ceded - Others'.
+- Branch indicates the geographical business unit handling the contract, e.g., 'Europe', 'LATAM', 'North America'.
+- Loss Type captures the nature of the loss, and may be one of: 'ATT', 'CAT', 'LARGE', 'THREAT', or 'Disc'.
+- Underwriting Year represents the year in which the policy was underwritten or originated.
+- Incurred Loss represents the total loss incurred to date, including paid and case reserves.
+- Paid Loss is the portion of the Incurred Loss that has already been settled and paid out.
+- IBNR is calculated as the difference between Ultimate Loss and Incurred Loss.
+- Ultimate Loss is the projected final value of loss.
+- Ultimate Premium refers to the projected premium expected to be earned.
+- Loss Ratio is calculated as Ultimate Loss divided by Ultimate Premium.
+- AvE Incurred = Expected - Actual Incurred.
+- AvE Paid = Expected - Actual Paid.
+- Budget Premium is the forecasted premium for budgeting.
+- Budget Loss is the projected loss for budgeting.
+- Earned Premium is the portion of the premium that has been earned.
+- Case Reserves = Incurred Loss - Paid Loss.
+"""
+
 STATE_KEYS_SET_AT_ENTRY = [
     "user_prompt", 
     "doc_loaded", 
@@ -136,6 +158,7 @@ STATE_KEYS_SET_AT_ENTRY = [
 def prune_state(state: GraphState, exclude: List[str]) -> dict:
     return {k: v for k, v in state.items() if k not in exclude}
 
+
 # ---- Router Node (with prompt generation) ----
 class RouterNode(Runnable):
     def invoke(self, state: GraphState, config=None) -> GraphState:
@@ -146,44 +169,74 @@ class RouterNode(Runnable):
         You are an intelligent routing agent. Your job is to:
         1. Choose one of the paths: "sql", "search", "document", "comp" based on the user prompt.
         2. Choose:
-        - "sql" if the user is asking a question about structured insurance data or something that can be answered from the following database schema:
+        - "sql" if the user is asking a question about structured insurance data (e.g. claims, premiums, reserves, IBNR, trends, comparisons across years or products) or something that can be answered from the following database schema:
             {schema}
+        - Use this additional documentation to better understand column meanings:
+          {documentation}
         - Additionally, here are some examples of SQL-style questions and their corresponding queries (QSPairs):
           {qs_examples}
         -EVEN IF the user also says things like "plot", "draw", "visualize", "graph", "bar chart", etc. — that still means they want structured data **along with** a chart. SO route it to SQL
             Example: "Show me IBNR over years and plot a bar chart" → route = "sql"
-    
-
-        - "document" ONLY if a document is uploaded (Document Uploaded = yes) AND the question involves updating/reading a document.
-
-        - "search" if it's a general query, involves latest events, external info, or cannot be answered from structured data.
-
-        3. If the route is "document", include:
-        - "vanna_prompt": an SQL-style question to query structured data.
-        - "fuzzy_prompt": a natural language description of the header or table to update.
-
-        4. If the route is "sql" or "search", DO NOT include vanna_prompt or fuzzy_prompt.
-
-        5. If the route is "sql", include vanna_prompt, but don't include fuzzy_prompt
-        -(eg: User Prompt is "Show me exposure year wise incurred loss and plot a graph", then 
-        -vanna_prompt will be "Shoe me exposure year wise incurred loss".
-        -Your work is to remove the noise and focus only on things that are required to generate sql query from vanna. SO remove all the extra stuffs out of the user prompt.
+        -Route it to "sql" if queries includes the below mentioned:
+            - Asks for trends, breakdowns, or aggregations of internal metrics (e.g., IBNR, reserves, severity, premiums, earned/ultimate loss)
+            - Ask for trends **within internal data only**
+            - Compares **internal data over time or segments** (e.g., years, lines of business, regions)
+            - Ask for charts or visualizations ("plot", "bar chart", etc.)
+            - Does NOT involve external benchmarking
+            Even if the prompt includes words like "compare" or "change", still route to SQL if the context is strictly internal.
+        -If the route is "sql", include vanna_prompt, but don't include fuzzy_prompt
+            -(eg: User Prompt is "Show me exposure year wise incurred loss and plot a graph", then 
+            -vanna_prompt will be "Shoe me exposure year wise incurred loss".
+            -Your work is to remove the noise and focus only on things that are required to generate sql query from vanna. SO remove all the extra stuffs out of the user prompt.
 
 
-        6. "comp" if the user is explicitly asking to compare internal data with external insights 
+        3. "document" ONLY if a document is uploaded (Document Uploaded = yes) AND the question involves updating/reading a document.
+        -If the route is "document", include:
+            - "vanna_prompt": an SQL-style question to query structured data.
+            - "fuzzy_prompt": a natural language description of the header or table to update.
+
+        
+        4. Choose "search" if:
+            - The user is asking about general or external information
+            - Involves real-time info, news, global economic trends, regulations
+            - The query cannot be answered by internal structured data or uploaded document
+        - If the route is "search", DO NOT include vanna_prompt or fuzzy_prompt.
+
+
+        5.Choose "comp" when the user is comparing internal data against external data, competitors, or industry benchmarks.
+            Examples include peer review, benchmarking, market positioning, or competitive ratios.
+
+            Trigger words/phrases (especially relevant for Actuarial & Finance users):
+            - "industry benchmark"
+            - "market average"
+            - "how do we compare to..."
+            - "peer comparison"
+            - "market trend vs ours"
+            - "against competitors"
+            - "vs industry"
+            - "benchmarking analysis"
+            - "loss ratio gap with peers"
+            - "pricing differential with market"
+            - "expense ratio compared to competition"
+            - "where do we stand in market"
+            - "relative to industry"
+            - "competitive advantage in reserves"
+            - "our severity vs others"
+            - "compare to S&P average" / "AM Best stats" / "regulatory benchmark"
         -(e.g.,User Prompt is "Compare IBNR trends with industry benchmarks for exposure year 2025 ")
         - Return Vanna_prompt as well as "Show IBNR trends for exposure year 2025"
         -Do not include fuzzy_prompt
         -Only include relevant columns in vanna_prompt. Do not include ClaimNumber or ID columns unless the user specifically asks for them.
 
 
-        Return output strictly in valid JSON format.
+        Return output strictly in valid JSON format using double quotes and commas properly.
+        DO NOT include any trailing commas. Your JSON must be parseable by Python's json.loads().
 
         Examples:
 
         For SQL:
         {{
-            "route": "sql"
+            "route": "sql",
             "vanna_prompt": "Show IBNR trends for exposure year 2025"
         }}
 
@@ -196,8 +249,8 @@ class RouterNode(Runnable):
 
         For Comp:
         {{
-             "route": "comp"
-             "vanna_prompt": "Show IBNR trends for exposure year 2025",
+             "route": "comp",
+             "vanna_prompt": "Show IBNR trends for exposure year 2025"
         }}
 
         For Search:
@@ -390,28 +443,80 @@ def serp_node(state: GraphState) -> GraphState:
 
     # ✨ Add LLM-generated general summary with numeric insights
     combined_text = "\n".join(summaries)
-    general_summary_prompt = f"""
-    You are an insurance and actuarial analyst.
 
-    Your task is to extract **concise and numerically rich insights** from the following web snippets, in response to this user query:
+    # Build conditional prompt for COMP vs SERP node - COMP includes SQL snippet
+    if "sql_query" in state and state["sql_query"]:
+        sql_snippet = f"\n🧾 Internal SQL Query:\n{state['sql_query']}"
+    else:
+        sql_snippet = ""
 
-    "{state['user_prompt']}"
+    if "sql_result" in state and isinstance(state["sql_result"], pd.DataFrame):
+        sql_snippet += f"\n\n📊 Top 5 rows of SQL Output:\n{state['sql_result'].head(5).to_markdown(index=False)}"
 
-    Snippets:
-    {combined_text}
+    # ✅ If COMP node passed Vanna data
+    if sql_snippet:
+        general_summary_prompt = f"""
+        You are an insurance and actuarial analyst comparing internal company data with external web results.
 
-    Your summary should:
-    - Be structured and no more than **6–8 lines**
-    - Include **percentages**, **currency values**, **ratios**, **dates**, and **growth trends** wherever found
-    - Mention key **KPIs** (e.g., IBNR, premiums, loss ratios, reserves)
-    - Avoid repeating the snippets. Instead, **synthesize them**
-    - If no numbers are found, say so explicitly
+        Use the following INTERNAL SQL DATA ONLY FOR CONTEXT. **Do not include internal tables or numbers in your output.**
 
-    Output format:
-    1. 📌 Start with a 1-line summary of overall findings.
-    2. 🔢 Then list 3–4 **quantitative highlights**.
-    3. 💬 End with any notable quote or number from a source if applicable.
-    """
+        🧾 Internal SQL Query:
+        {state['sql_query'] if 'sql_query' in state else ''}
+
+        📊 Top 5 rows of SQL Output (reference only, do not display):
+        {state['sql_result'].head(5).to_markdown(index=False) if isinstance(state['sql_result'], pd.DataFrame) else ''}
+
+        ---
+
+        Now, using only the following external web snippets, write a summary:
+
+        🔍 Web Snippets:
+        {combined_text}
+
+        ---
+
+        User Prompt:
+        "{state['user_prompt']}"
+
+
+        🔽 Your Task:
+        - Summarize **only what is found in the external data**
+        - DO NOT display the internal SQL data or repeat it
+        - Be concise, no more than **6–8 lines**
+        - Include **percentages, currency, loss ratios, IBNR**, and other KPIs found in the web
+        - Avoid repeating full articles or sentences
+
+        Output format:
+        1. 📌 Start with a summary of overall findings.
+        2. 🔢 Then list 3–4 **quantitative highlights**.
+        3. 💬 End with any notable quote or number from a source if applicable.
+        4. Can include a table with numerical insights as well, but not the internal data or tabular data. Only if you found it in external data.
+        """
+    else:
+        # 🔁 Fall back to generic summary for plain search node
+        general_summary_prompt = f"""
+        You are an insurance and actuarial analyst.
+
+        Your task is to extract **concise and numerically rich insights** from the following web snippets, in response to this user query:
+
+        "{state['user_prompt']}"
+
+        Snippets:
+        {combined_text}
+
+        Your summary should:
+        - Be structured and no more than **6–8 lines**
+        - Include **percentages**, **currency values**, **ratios**, **dates**, and **growth trends**
+        - Mention key **KPIs** (e.g., IBNR, premiums, loss ratios, reserves)
+        - Avoid repeating the snippets. Instead, **synthesize them**
+        - If no numbers are found, say so explicitly
+
+        Output format:
+        1. 📌 Start with a summary of overall findings.
+        2. 🔢 Then list 3–4 **quantitative highlights**.
+        3. 💬 End with any notable quote or number from a source if applicable.
+        4. Can include a table with numerical insights as well
+        """
 
     general_summary = call_llm(general_summary_prompt)
     print("General summary generated:", general_summary)
@@ -442,7 +547,7 @@ def comp_node(state: GraphState) -> GraphState:
     sql_df = parsed_result
     
     # Step 2: Run Serp Search
-    serp_result = serp_node(state)
+    serp_result = serp_node({**state, "sql_query": sql_query, "sql_result": sql_df})
     web_links = serp_result.get("web_links")
 
     external_summary = serp_result.get("general_summary", "")
@@ -949,7 +1054,7 @@ if st.session_state.active_chat_index is None:
 
 
         with col_left:
-            # ✅ Output rendering (same as before)
+            # ✅ Output rendering
             if output.get("route") in ["sql", "document", "comp"] and output.get("sql_result") is not None:
                 st.subheader("SQL Query Result:")
                 if output.get("sql_query"):  # For live session
@@ -959,7 +1064,10 @@ if st.session_state.active_chat_index is None:
                     if isinstance(sql_df, pd.DataFrame):
                         formatted_df = sql_df.copy()
                         for col in formatted_df.select_dtypes(include='number').columns:
-                            if any(keyword in col.lower() for keyword in money_keywords):
+                            col_lower = col.lower()
+                            if "ratio" in col_lower:
+                                formatted_df[col] = formatted_df[col].apply(lambda x: f"{x * 100:.2f}%" if pd.notnull(x) else "")
+                            elif any(keyword in col_lower for keyword in money_keywords):
                                 formatted_df[col] = formatted_df[col].apply(lambda x: f"{x:,.0f}")
 
                         st.dataframe(formatted_df)
@@ -1042,7 +1150,10 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
         if isinstance(result_df, pd.DataFrame):
             formatted_df = result_df.copy()
             for col in formatted_df.select_dtypes(include='number').columns:
-                if any(keyword in col.lower() for keyword in money_keywords):
+                col_lower = col.lower()
+                if "ratio" in col_lower:
+                    formatted_df[col] = formatted_df[col].apply(lambda x: f"{x * 100:.2f}%" if pd.notnull(x) else "")
+                elif any(keyword in col_lower for keyword in money_keywords):
                     formatted_df[col] = formatted_df[col].apply(lambda x: f"{x:,.0f}")
             st.dataframe(formatted_df)
         else:
@@ -1072,7 +1183,10 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
         if isinstance(result_df, pd.DataFrame):
             formatted_df = result_df.copy()
             for col in formatted_df.select_dtypes(include='number').columns:
-                if any(keyword in col.lower() for keyword in money_keywords):
+                col_lower = col.lower()
+                if "ratio" in col_lower:
+                    formatted_df[col] = formatted_df[col].apply(lambda x: f"{x * 100:.2f}%" if pd.notnull(x) else "")
+                elif any(keyword in col_lower for keyword in money_keywords):
                     formatted_df[col] = formatted_df[col].apply(lambda x: f"{x:,.0f}")
             st.dataframe(formatted_df)
         else:
@@ -1097,6 +1211,5 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     ppt_buffer = generate_ppt(entry)
     st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
-
 
 
