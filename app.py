@@ -27,6 +27,8 @@ from pptx.util import Inches, Pt
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 from pptx.dml.color import RGBColor
 import io
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OpenAIEmbeddings
 
 
 st.set_page_config(layout="wide")
@@ -86,6 +88,8 @@ class GraphState(TypedDict):
     comparison_summary: Optional[str]
     general_summary: Optional[str]
     sql_query: Optional[str]
+    chroma_summary: Optional[str]
+    chroma_sources: Optional[list[tuple[str, str]]]
 
 
 def get_schema_description(db_path: str) -> str:
@@ -151,7 +155,9 @@ STATE_KEYS_SET_AT_ENTRY = [
     "updated_doc_path",
     "chart_info",
     "comparison_summary",
-    "general_summary"
+    "general_summary",
+    "chroma_summary", 
+    "chroma_sources"
 ]
 
 
@@ -167,7 +173,7 @@ class RouterNode(Runnable):
 
         router_prompt = f"""
         You are an intelligent routing agent. Your job is to:
-        1. Choose one of the paths: "sql", "search", "document", "comp" based on the user prompt.
+        1. Choose one of the paths: "sql", "search", "document", "comp", "chromadb" based on the user prompt.
         2. Choose:
         - "sql" if the user is asking a question about structured insurance data (e.g. claims, premiums, reserves, IBNR, trends, comparisons across years or products) or something that can be answered from the following database schema:
             {schema}
@@ -228,6 +234,15 @@ class RouterNode(Runnable):
         -Do not include fuzzy_prompt
         -Only include relevant columns in vanna_prompt. Do not include ClaimNumber or ID columns unless the user specifically asks for them.
 
+       
+        6. Choose "chromadb" when:
+        - The prompt asks about the Sparta platform, Earmark Template, Branch Adjustment Template/Module, Projects in Sparta, or any internal process or documentation.
+        - The user seems to be referring to internal workflows, or knowledge base content.
+        -Example prompts that should be routed to `"chromadb"`:
+            - "What are the steps in the Branch Adjustment Module?"
+            - "Explain how Earmark Template is used in our process."
+            - "Can you summarize Projects in Sparta?"
+
 
         Return output strictly in valid JSON format using double quotes and commas properly.
         DO NOT include any trailing commas. Your JSON must be parseable by Python's json.loads().
@@ -258,6 +273,11 @@ class RouterNode(Runnable):
             "route": "search"
         }}
 
+        For chromadb 
+        {{
+        "route": "chromadb"
+        }}
+
         User Prompt: "{state['user_prompt']}"
         Document Uploaded: {doc_flag}
         """
@@ -279,7 +299,7 @@ class RouterNode(Runnable):
             parsed = {"route": "search"}
 
         # ✅ Enforce safety: remove vanna_prompt if not 'document' or 'comp'
-        if parsed.get("route") not in ["document", "comp", "sql"]:
+        if parsed.get("route") not in ["document", "comp", "sql", "chromadb"]:
             parsed["vanna_prompt"] = None
             parsed["fuzzy_prompt"] = None
 
@@ -596,6 +616,40 @@ def comp_node(state: GraphState) -> GraphState:
     }
 
 
+
+# ChromaDB node to extract internal docs
+def chromadb_node(state: GraphState) -> GraphState:
+    chroma = Chroma(
+        persist_directory="chroma_storage/",
+        collection_name="SPARTA_docs",
+        embedding_function=OpenAIEmbeddings()
+    )
+    retriever = chroma.as_retriever()
+    docs = retriever.get_relevant_documents(state["user_prompt"])
+
+    content_snippets = "\n\n---\n\n".join(d.page_content[:500] for d in docs[:5])
+    summary_prompt = f"""
+    Based on the following retrieved document chunks from internal knowledge base, answer the user's query:
+
+    User Prompt: {state['user_prompt']}
+
+    Documents:
+    {content_snippets}
+
+    Provide a concise and structured answer with key points or numeric details if found.
+    """
+    summary = call_llm(summary_prompt)
+
+    return {
+        **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
+        "chroma_summary": summary,
+        "chroma_sources": [(d.metadata.get("source_doc", "Doc"), d.page_content[:300]) for d in docs]
+    }
+
+
+
+
+
 # ---- Document Table Update Node ----
 def document_node(state: GraphState) -> GraphState:
     doc_path = state['document_path']
@@ -694,6 +748,7 @@ def visualize_workflow(builder, active_route=None):
         "sql": "vanna_sql",
         "search": "serp_search",
         "document": "doc_update",
+        "chromadb": "chromadb",
         "comp": "comp"
     }
 
@@ -716,7 +771,7 @@ def visualize_workflow(builder, active_route=None):
             edge_styles[(source, target)] = {"style": "solid", "color": "black", "width": 1.5}
 
     # Always show dashed edges from router to all 3 branches
-    for target in ["vanna_sql", "serp_search", "doc_update", "comp"]:
+    for target in ["vanna_sql", "serp_search", "doc_update", "comp", "chromadb"]:
         if ("router", target) not in G.edges:
             G.add_edge("router", target)
         edge_styles[("router", target)] = {"style": "dashed", "color": "gray", "width": 1}
@@ -727,13 +782,14 @@ def visualize_workflow(builder, active_route=None):
 
     # Positions for nodes
     pos = {
-        "__start__": (1.5, 4),
-        "router": (1.5, 3),
+        "__start__": (2, 4),
+        "router": (2, 3),
         "vanna_sql": (0, 2),
         "serp_search": (1, 2),
         "doc_update": (2, 2),
         "comp": (3, 2),
-        "__end__": (1.5, 1),
+        "chromadb": (4, 2),
+        "__end__": (2, 1),
     }
 
     plt.figure(figsize=(6, 5))
@@ -859,6 +915,40 @@ def generate_ppt(entry) -> BytesIO:
             summary_p.font.size = Pt(12)
             summary_p.space_after = Pt(6)
 
+    if route == "chromadb":
+        # 🧠 Chroma Summary Slide
+        slide = prs.slides.add_slide(layout)
+        slide.shapes.title.text = "ChromaDB Summary"
+
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5.0))
+        tf = box.text_frame
+        tf.word_wrap = True
+
+        summary_text = entry.get("chroma_summary", "No summary available.")
+        for para in summary_text.split("\n"):
+            if para.strip():
+                p = tf.add_paragraph()
+                p.text = para.strip()
+                p.font.size = Pt(14)
+                p.space_after = Pt(4)
+
+        # 📄 Source Slides
+        for i, (doc, snippet) in enumerate(entry.get("chroma_sources", []), 1):
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = f"Source {i}: {doc}"
+
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5.0))
+            tf = box.text_frame
+            tf.word_wrap = True
+
+            for para in snippet.split("\n"):
+                if para.strip():
+                    p = tf.add_paragraph()
+                    p.text = para.strip()
+                    p.font.size = Pt(12)
+                    p.space_after = Pt(3)
+
+
     # Finalize PPT in memory
     ppt_bytes = BytesIO()
     prs.save(ppt_bytes)
@@ -874,12 +964,14 @@ graph_builder.add_node("vanna_sql", vanna_node)
 graph_builder.add_node("serp_search", serp_node)
 graph_builder.add_node("doc_update", document_node)
 graph_builder.add_node("comp", comp_node)
+graph_builder.add_node("chromadb", chromadb_node)
 
 def router_logic(state: GraphState):
     if state['route'] == 'sql': return "vanna_sql"
     elif state['route'] == 'search': return "serp_search"
     elif state['route'] == 'document': return "doc_update"
     elif state['route'] == 'comp': return "comp"
+    elif state['route'] == 'chromadb': return "chromadb"
     else: return END    
 
 graph_builder.set_entry_point("router")
@@ -897,6 +989,7 @@ graph_builder.add_edge("vanna_sql", END)
 graph_builder.add_edge("serp_search", END)
 graph_builder.add_edge("doc_update", END)
 graph_builder.add_edge("comp", END)
+graph_builder.add_edge("chromadb", END)
 
 agent_graph = graph_builder.compile()
 
@@ -1038,7 +1131,9 @@ if st.session_state.active_chat_index is None:
             "web_links": output.get("web_links"),
             "general_summary": output.get("general_summary"),
             "comparison_summary": output.get("comparison_summary"),
-            "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p")
+            "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+            "chroma_summary": output.get("chroma_summary"),
+            "chroma_sources": output.get("chroma_sources")
         }
 
         st.session_state.chat_history.append(chat_entry)
@@ -1107,6 +1202,15 @@ if st.session_state.active_chat_index is None:
             if output.get("route") == "comp" and output.get("comparison_summary"):
                 st.subheader("🆚 Comparison Summary:")
                 st.markdown(output["comparison_summary"])
+            
+            if output.get("route") == "chromadb":
+                st.subheader("📘 Internal Knowledge Base Answer:")
+                st.markdown(output.get("chroma_summary", "_No summary available._"))
+
+                st.subheader("📄 Document Sources:")
+                for i, (docname, snippet) in enumerate(output.get("chroma_sources", []), 1):
+                    st.markdown(f"**{i}. {docname}**\n\n{snippet}")
+
 
             if output.get("updated_doc_path"):
                 with open(output["updated_doc_path"], "rb") as f:
@@ -1158,6 +1262,14 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
             st.dataframe(formatted_df)
         else:
             st.text(result_df)
+
+    elif entry["route"] == "chromadb":
+            st.subheader("📘 Internal Knowledge Base Answer:")
+            st.markdown(entry.get("chroma_summary", "_No summary available._"))
+
+            st.subheader("📄 Document Sources:")
+            for i, (docname, snippet) in enumerate(entry.get("chroma_sources", []), 1):
+                st.markdown(f"**{i}. {docname}**\n\n{snippet}")
 
     elif entry["route"] == "search":
         if entry.get("general_summary"):
@@ -1211,5 +1323,6 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     ppt_buffer = generate_ppt(entry)
     st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
+
 
 
