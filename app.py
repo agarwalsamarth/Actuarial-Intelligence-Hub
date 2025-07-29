@@ -27,7 +27,7 @@ from pptx.util import Inches, Pt
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 from pptx.dml.color import RGBColor
 import io
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import OpenAIEmbeddings
 
 
@@ -88,8 +88,8 @@ class GraphState(TypedDict):
     comparison_summary: Optional[str]
     general_summary: Optional[str]
     sql_query: Optional[str]
-    chroma_summary: Optional[str]
-    chroma_sources: Optional[list[tuple[str, str]]]
+    faiss_summary: Optional[str]
+    faiss_sources: Optional[list[tuple[str, str]]]
 
 
 def get_schema_description(db_path: str) -> str:
@@ -156,8 +156,8 @@ STATE_KEYS_SET_AT_ENTRY = [
     "chart_info",
     "comparison_summary",
     "general_summary",
-    "chroma_summary", 
-    "chroma_sources"
+    "faiss_summary", 
+    "faiss_sources"
 ]
 
 
@@ -173,7 +173,7 @@ class RouterNode(Runnable):
 
         router_prompt = f"""
         You are an intelligent routing agent. Your job is to:
-        1. Choose one of the paths: "sql", "search", "document", "comp", "chromadb" based on the user prompt.
+        1. Choose one of the paths: "sql", "search", "document", "comp", "faissdb" based on the user prompt.
         2. Choose:
         - "sql" if the user is asking a question about structured insurance data (e.g. claims, premiums, reserves, IBNR, trends, comparisons across years or products) or something that can be answered from the following database schema:
             {schema}
@@ -235,10 +235,10 @@ class RouterNode(Runnable):
         -Only include relevant columns in vanna_prompt. Do not include ClaimNumber or ID columns unless the user specifically asks for them.
 
        
-        6. Choose "chromadb" when:
+        6. Choose "faissdb" when:
         - The prompt asks about the Sparta platform, Earmark Template, Branch Adjustment Template/Module, Projects in Sparta, or any internal process or documentation.
         - The user seems to be referring to internal workflows, or knowledge base content.
-        -Example prompts that should be routed to `"chromadb"`:
+        -Example prompts that should be routed to `"faissdb"`:
             - "What are the steps in the Branch Adjustment Module?"
             - "Explain how Earmark Template is used in our process."
             - "Can you summarize Projects in Sparta?"
@@ -273,9 +273,9 @@ class RouterNode(Runnable):
             "route": "search"
         }}
 
-        For chromadb 
+        For faissdb 
         {{
-        "route": "chromadb"
+        "route": "faissdb"
         }}
 
         User Prompt: "{state['user_prompt']}"
@@ -299,7 +299,7 @@ class RouterNode(Runnable):
             parsed = {"route": "search"}
 
         # ✅ Enforce safety: remove vanna_prompt if not 'document' or 'comp'
-        if parsed.get("route") not in ["document", "comp", "sql", "chromadb"]:
+        if parsed.get("route") not in ["document", "comp", "sql", "faissdb"]:
             parsed["vanna_prompt"] = None
             parsed["fuzzy_prompt"] = None
 
@@ -617,14 +617,14 @@ def comp_node(state: GraphState) -> GraphState:
 
 
 
-# ChromaDB node to extract internal docs
-def chromadb_node(state: GraphState) -> GraphState:
-    chroma = Chroma(
-        persist_directory="chroma_storage/",
-        collection_name="SPARTA_docs",
-        embedding_function=OpenAIEmbeddings()
+# faissdb node to extract internal docs
+def faissdb_node(state: GraphState) -> GraphState:
+    faiss = FAISS.load_local(
+        folder_path="faiss_index/",
+        embeddings=OpenAIEmbeddings(),
+        allow_dangerous_deserialization=True
     )
-    retriever = chroma.as_retriever()
+    retriever = faiss.as_retriever()
     docs = retriever.get_relevant_documents(state["user_prompt"])
 
     content_snippets = "\n\n---\n\n".join(d.page_content[:500] for d in docs[:5])
@@ -642,10 +642,9 @@ def chromadb_node(state: GraphState) -> GraphState:
 
     return {
         **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
-        "chroma_summary": summary,
-        "chroma_sources": [(d.metadata.get("source_doc", "Doc"), d.page_content[:300]) for d in docs]
+        "faiss_summary": summary,
+        "faiss_sources": [(d.metadata.get("source_doc", "Doc"), d.page_content[:300]) for d in docs]
     }
-
 
 
 
@@ -748,7 +747,7 @@ def visualize_workflow(builder, active_route=None):
         "sql": "vanna_sql",
         "search": "serp_search",
         "document": "doc_update",
-        "chromadb": "chromadb",
+        "faissdb": "faissdb",
         "comp": "comp"
     }
 
@@ -771,7 +770,7 @@ def visualize_workflow(builder, active_route=None):
             edge_styles[(source, target)] = {"style": "solid", "color": "black", "width": 1.5}
 
     # Always show dashed edges from router to all 3 branches
-    for target in ["vanna_sql", "serp_search", "doc_update", "comp", "chromadb"]:
+    for target in ["vanna_sql", "serp_search", "doc_update", "comp", "faissdb"]:
         if ("router", target) not in G.edges:
             G.add_edge("router", target)
         edge_styles[("router", target)] = {"style": "dashed", "color": "gray", "width": 1}
@@ -788,7 +787,7 @@ def visualize_workflow(builder, active_route=None):
         "serp_search": (1, 2),
         "doc_update": (2, 2),
         "comp": (3, 2),
-        "chromadb": (4, 2),
+        "faissdb": (4, 2),
         "__end__": (2, 1),
     }
 
@@ -915,16 +914,16 @@ def generate_ppt(entry) -> BytesIO:
             summary_p.font.size = Pt(12)
             summary_p.space_after = Pt(6)
 
-    if route == "chromadb":
-        # 🧠 Chroma Summary Slide
+    if route == "faissdb":
+        # 🧠 faiss Summary Slide
         slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = "ChromaDB Summary"
+        slide.shapes.title.text = "faissdb Summary"
 
         box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5.0))
         tf = box.text_frame
         tf.word_wrap = True
 
-        summary_text = entry.get("chroma_summary", "No summary available.")
+        summary_text = entry.get("faiss_summary", "No summary available.")
         for para in summary_text.split("\n"):
             if para.strip():
                 p = tf.add_paragraph()
@@ -933,7 +932,7 @@ def generate_ppt(entry) -> BytesIO:
                 p.space_after = Pt(4)
 
         # 📄 Source Slides
-        for i, (doc, snippet) in enumerate(entry.get("chroma_sources", []), 1):
+        for i, (doc, snippet) in enumerate(entry.get("faiss_sources", []), 1):
             slide = prs.slides.add_slide(layout)
             slide.shapes.title.text = f"Source {i}: {doc}"
 
@@ -964,14 +963,14 @@ graph_builder.add_node("vanna_sql", vanna_node)
 graph_builder.add_node("serp_search", serp_node)
 graph_builder.add_node("doc_update", document_node)
 graph_builder.add_node("comp", comp_node)
-graph_builder.add_node("chromadb", chromadb_node)
+graph_builder.add_node("faissdb", faissdb_node)
 
 def router_logic(state: GraphState):
     if state['route'] == 'sql': return "vanna_sql"
     elif state['route'] == 'search': return "serp_search"
     elif state['route'] == 'document': return "doc_update"
     elif state['route'] == 'comp': return "comp"
-    elif state['route'] == 'chromadb': return "chromadb"
+    elif state['route'] == 'faissdb': return "faissdb"
     else: return END    
 
 graph_builder.set_entry_point("router")
@@ -989,7 +988,7 @@ graph_builder.add_edge("vanna_sql", END)
 graph_builder.add_edge("serp_search", END)
 graph_builder.add_edge("doc_update", END)
 graph_builder.add_edge("comp", END)
-graph_builder.add_edge("chromadb", END)
+graph_builder.add_edge("faissdb", END)
 
 agent_graph = graph_builder.compile()
 
@@ -1132,8 +1131,8 @@ if st.session_state.active_chat_index is None:
             "general_summary": output.get("general_summary"),
             "comparison_summary": output.get("comparison_summary"),
             "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p"),
-            "chroma_summary": output.get("chroma_summary"),
-            "chroma_sources": output.get("chroma_sources")
+            "faiss_summary": output.get("faiss_summary"),
+            "faiss_sources": output.get("faiss_sources")
         }
 
         st.session_state.chat_history.append(chat_entry)
@@ -1203,12 +1202,12 @@ if st.session_state.active_chat_index is None:
                 st.subheader("🆚 Comparison Summary:")
                 st.markdown(output["comparison_summary"])
             
-            if output.get("route") == "chromadb":
+            if output.get("route") == "faissdb":
                 st.subheader("📘 Internal Knowledge Base Answer:")
-                st.markdown(output.get("chroma_summary", "_No summary available._"))
+                st.markdown(output.get("faiss_summary", "_No summary available._"))
 
                 st.subheader("📄 Document Sources:")
-                for i, (docname, snippet) in enumerate(output.get("chroma_sources", []), 1):
+                for i, (docname, snippet) in enumerate(output.get("faiss_sources", []), 1):
                     st.markdown(f"**{i}. {docname}**\n\n{snippet}")
 
 
@@ -1263,12 +1262,12 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
         else:
             st.text(result_df)
 
-    elif entry["route"] == "chromadb":
+    elif entry["route"] == "faissdb":
             st.subheader("📘 Internal Knowledge Base Answer:")
-            st.markdown(entry.get("chroma_summary", "_No summary available._"))
+            st.markdown(entry.get("faiss_summary", "_No summary available._"))
 
             st.subheader("📄 Document Sources:")
-            for i, (docname, snippet) in enumerate(entry.get("chroma_sources", []), 1):
+            for i, (docname, snippet) in enumerate(entry.get("faiss_sources", []), 1):
                 st.markdown(f"**{i}. {docname}**\n\n{snippet}")
 
     elif entry["route"] == "search":
@@ -1323,6 +1322,8 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     ppt_buffer = generate_ppt(entry)
     st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
+
+
 
 
 
