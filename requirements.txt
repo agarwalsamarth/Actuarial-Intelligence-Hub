@@ -35,8 +35,7 @@ networkx==3.5
 python-pptx
 
 # Vector DB for internal document search
-chromadb>=0.4.24
-tiktoken>=0.5.1
+faiss-cpu>=1.7.4
 
 
 # Optional: Uncomment if you face Pydantic-related issues
