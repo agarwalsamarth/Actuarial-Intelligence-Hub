@@ -10,7 +10,7 @@ huggingface-hub>=0.21.4
 transformers>=4.40.0
 
 # SerpAPI (you can still use it or skip if replacing with GoogleSearch)
-#serpapi>=0.1.5
+serpapi>=0.1.5
 google-search-results
 requests>=2.31.0
 
@@ -33,6 +33,11 @@ networkx==3.5
 
 #Powerpoint
 python-pptx
+
+# Vector DB for internal document search
+chromadb>=0.4.24
+tiktoken>=0.5.1
+
 
 # Optional: Uncomment if you face Pydantic-related issues
 # pydantic<2
