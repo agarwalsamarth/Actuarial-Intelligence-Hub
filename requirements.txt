@@ -35,6 +35,7 @@ networkx==3.5
 python-pptx
 
 # Vector DB for internal document search
+tiktoken>=0.5.1
 faiss-cpu>=1.7.4
 
 
