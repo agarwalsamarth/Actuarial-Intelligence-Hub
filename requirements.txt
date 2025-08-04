@@ -39,6 +39,11 @@ tiktoken>=0.5.1
 faiss-cpu>=1.7.4
 
 
+# === OCR & Image Processing (No sudo required) ===
+easyocr
+Pillow>=9.0.0
+
+
 # Optional: Uncomment if you face Pydantic-related issues
 # pydantic<2
 
@@ -47,3 +52,4 @@ faiss-cpu>=1.7.4
 #venv\Scripts\activate
 #Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 #venv\Scripts\Activate.ps1
+
