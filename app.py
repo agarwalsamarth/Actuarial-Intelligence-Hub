@@ -1278,18 +1278,21 @@ if st.session_state.active_chat_index is None:
                                 st.image(img_path, caption=meta.get("caption", ""), use_container_width=True)
 
                 st.subheader("📄 Document Sources:")
+                base_dir = os.path.dirname(__file__)
                 for i, (docname, snippet, path) in enumerate(output.get("faiss_sources", []), 1):
                     st.markdown(f"**{i}. {docname}**\n\n{snippet}")
                     #st.code(f"📁 File path: {path}")
                     #st.code(f"🧪 Exists: {os.path.exists(path) if path else 'No path'}")
-                    if path and os.path.exists(path):
-                        with open(path, "rb") as f:
-                            st.download_button(
-                                label=f"📥 Download {os.path.basename(path)}",
-                                data=f,
-                                file_name=os.path.basename(path),
-                                key=f"download_doc_{i}"
-                            )
+                    if path:
+                        full_path = os.path.join(base_dir, path).replace("\\", "/")
+                        if os.path.exists(full_path):
+                            with open(full_path, "rb") as f:
+                                st.download_button(
+                                    label=f"📥 Download {os.path.basename(path)}",
+                                    data=f,
+                                    file_name=os.path.basename(path),
+                                    key=f"download_doc_{i}"
+                                )
 
 
 
@@ -1363,19 +1366,22 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
         # === Show Document Sources with Download Buttons ===
         st.subheader("📄 Document Sources:")
+        base_dir = os.path.dirname(__file__)
         for i, (docname, snippet, path) in enumerate(faiss_sources, 1):
             col1, col2 = st.columns([0.85, 0.15])
             with col1:
                 st.markdown(f"**{i}. {docname}**\n\n{snippet}")
             with col2:
-                if path and os.path.exists(path):
-                    with open(path, "rb") as f:
-                        st.download_button(
-                            label="⬇️",
-                            data=f,
-                            file_name=os.path.basename(path),
-                            key=f"download_history_{i}"
-                        )
+                if path:
+                    full_path = os.path.join(base_dir, path).replace("\\", "/")
+                    if os.path.exists(full_path):
+                        with open(path, "rb") as f:
+                            st.download_button(
+                                label="⬇️",
+                                data=f,
+                                file_name=os.path.basename(path),
+                                key=f"download_history_{i}"
+                            )
 
     elif entry["route"] == "search":
         if entry.get("general_summary"):
@@ -1429,9 +1435,6 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     ppt_buffer = generate_ppt(entry)
     st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
-
-
-
 
 
 
