@@ -38,6 +38,9 @@ load_dotenv()
 #os.environ["LANGCHAIN_TRACING_V2"]="true"
 #os.environ["LANGCHAIN_API_KEY"]=os.getenv("LANGCHAIN_API_KEY")
 
+embedding = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
+faiss_index = FAISS.load_local("faiss_index", embedding, allow_dangerous_deserialization=True)
+
 # Keywords that usually indicate monetary columns
 money_keywords = ["loss", "premium", "amount", "cost", "ibnr", "ult", "total", "claim", "reserve", "payment"]
 
@@ -90,6 +93,7 @@ class GraphState(TypedDict):
     sql_query: Optional[str]
     faiss_summary: Optional[str]
     faiss_sources: Optional[list[tuple[str, str]]]
+    faiss_images: Optional[list[dict]]
 
 
 def get_schema_description(db_path: str) -> str:
@@ -157,7 +161,8 @@ STATE_KEYS_SET_AT_ENTRY = [
     "comparison_summary",
     "general_summary",
     "faiss_summary", 
-    "faiss_sources"
+    "faiss_sources",
+    "faiss_images"
 ]
 
 
@@ -624,10 +629,11 @@ def faissdb_node(state: GraphState) -> GraphState:
         embeddings=OpenAIEmbeddings(),
         allow_dangerous_deserialization=True
     )
-    retriever = faiss.as_retriever()
-    docs = retriever.get_relevant_documents(state["user_prompt"])
+    docs = faiss_index.similarity_search(state["user_prompt"], k=3)
 
-    content_snippets = "\n\n---\n\n".join(d.page_content[:500] for d in docs[:5])
+    top_docs = docs[:3]  # ⬅️ Top 3 instead of 5
+    content_snippets = "\n\n---\n\n".join(d.page_content[:500] for d in top_docs)
+
     summary_prompt = f"""
     Based on the following retrieved document chunks from internal knowledge base, answer the user's query:
 
@@ -640,10 +646,33 @@ def faissdb_node(state: GraphState) -> GraphState:
     """
     summary = call_llm(summary_prompt)
 
+    # Extract faiss_sources with source path
+    faiss_sources = []
+    all_images = []
+
+    for doc in top_docs:
+        doc_name = doc.metadata.get("source_doc", "Doc")
+        snippet = doc.page_content[:300]
+        path = doc.metadata.get("file_path")  # must be present in ingestion step
+        #print(f"[DEBUG] FAISS doc metadata: {doc.metadata}")
+        faiss_sources.append((doc_name, snippet, path))
+
+        # Load associated images
+        image_meta_path = os.path.join("extracted_images", "extracted_image_metadata.json")
+        if os.path.exists(image_meta_path):
+            with open(image_meta_path, 'r') as f:
+                all_metadata = json.load(f)
+            related_images = [
+                meta for meta in all_metadata
+                if meta["original_doc"] == doc_name
+            ]
+            all_images.extend(related_images)
+
     return {
         **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
         "faiss_summary": summary,
-        "faiss_sources": [(d.metadata.get("source_doc", "Doc"), d.page_content[:300]) for d in docs]
+        "faiss_sources": faiss_sources,
+        "faiss_images": all_images
     }
 
 
@@ -917,7 +946,7 @@ def generate_ppt(entry) -> BytesIO:
     if route == "faissdb":
         # 🧠 faiss Summary Slide
         slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = "faissdb Summary"
+        slide.shapes.title.text = "FAISS Summary"
 
         box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5.0))
         tf = box.text_frame
@@ -931,10 +960,11 @@ def generate_ppt(entry) -> BytesIO:
                 p.font.size = Pt(14)
                 p.space_after = Pt(4)
 
-        # 📄 Source Slides
-        for i, (doc, snippet) in enumerate(entry.get("faiss_sources", []), 1):
+        # 📄 Source Slides (with clickable file name in title if available)
+        for i, (docname, snippet, path) in enumerate(entry.get("faiss_sources", []), 1):
+            filename = os.path.basename(path) if path else docname
             slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Source {i}: {doc}"
+            slide.shapes.title.text = f"Source {i}: {filename}"
 
             box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5.0))
             tf = box.text_frame
@@ -946,6 +976,33 @@ def generate_ppt(entry) -> BytesIO:
                     p.text = para.strip()
                     p.font.size = Pt(12)
                     p.space_after = Pt(3)
+
+        # 🖼️ Image Slide (only from the most similar document)
+        faiss_images = entry.get("faiss_images", [])
+        faiss_sources = entry.get("faiss_sources", [])
+        if faiss_images and faiss_sources:
+            top_docname = faiss_sources[0][0]  # first doc's name
+            top_doc_images = [img for img in faiss_images if img.get("original_doc") == top_docname]
+
+            if top_doc_images:
+                slide = prs.slides.add_slide(prs.slide_layouts[5])  # blank layout
+                slide.shapes.title.text = f"Images from {top_docname}"
+
+                # Adjust layout
+                left = Inches(0.8)
+                top = Inches(2.5)  # ⬅️ Increased top margin
+                image_width = Inches(6)  # ⬅️ Increased width
+                spacing = Inches(0.6)
+
+                for idx, img_meta in enumerate(top_doc_images):
+                    img_path = img_meta.get("extracted_image_path")
+                    if img_path and os.path.exists(img_path):
+                        slide.shapes.add_picture(img_path, left, top, width=image_width)
+                        top += Inches(3.2)  # ⬅️ Increased vertical spacing
+
+                        if top > Inches(6.5):  # wrap to next column if needed
+                            top = Inches(2.0)
+                            left += image_width + spacing
 
 
     # Finalize PPT in memory
@@ -1104,7 +1161,10 @@ if st.session_state.active_chat_index is None:
             "web_links": None,
             "updated_doc_path": None,
             "comparison_summary": None,
-            "general_summary": None
+            "general_summary": None,
+            "faiss_summary": None,
+            "faiss_sources": None,
+            "faiss_images": None
         }
 
         with st.spinner("Running Agent..."):
@@ -1132,7 +1192,8 @@ if st.session_state.active_chat_index is None:
             "comparison_summary": output.get("comparison_summary"),
             "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p"),
             "faiss_summary": output.get("faiss_summary"),
-            "faiss_sources": output.get("faiss_sources")
+            "faiss_sources": output.get("faiss_sources"),
+            "faiss_images": output.get("faiss_images")
         }
 
         st.session_state.chat_history.append(chat_entry)
@@ -1206,9 +1267,31 @@ if st.session_state.active_chat_index is None:
                 st.subheader("📘 Internal Knowledge Base Answer:")
                 st.markdown(output.get("faiss_summary", "_No summary available._"))
 
+                # Show images related to the most similar doc
+                if output.get("faiss_images"):
+                    most_similar_doc = output["faiss_sources"][0][0]  # get docname
+                    st.subheader(f"🖼️ Images from: {most_similar_doc}")
+                    for meta in output["faiss_images"]:
+                        if meta["original_doc"] == most_similar_doc:
+                            img_path = meta["extracted_image_path"]
+                            if img_path and os.path.exists(img_path):
+                                st.image(img_path, caption=meta.get("caption", ""), use_container_width=True)
+
                 st.subheader("📄 Document Sources:")
-                for i, (docname, snippet) in enumerate(output.get("faiss_sources", []), 1):
+                for i, (docname, snippet, path) in enumerate(output.get("faiss_sources", []), 1):
                     st.markdown(f"**{i}. {docname}**\n\n{snippet}")
+                    #st.code(f"📁 File path: {path}")
+                    #st.code(f"🧪 Exists: {os.path.exists(path) if path else 'No path'}")
+                    if path and os.path.exists(path):
+                        with open(path, "rb") as f:
+                            st.download_button(
+                                label=f"📥 Download {os.path.basename(path)}",
+                                data=f,
+                                file_name=os.path.basename(path),
+                                key=f"download_doc_{i}"
+                            )
+
+
 
 
             if output.get("updated_doc_path"):
@@ -1263,12 +1346,36 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
             st.text(result_df)
 
     elif entry["route"] == "faissdb":
-            st.subheader("📘 Internal Knowledge Base Answer:")
-            st.markdown(entry.get("faiss_summary", "_No summary available._"))
+        st.subheader("📘 Internal Knowledge Base Answer:")
+        st.markdown(entry.get("faiss_summary", "_No summary available._"))
 
-            st.subheader("📄 Document Sources:")
-            for i, (docname, snippet) in enumerate(entry.get("faiss_sources", []), 1):
+        # === Show Associated Images from Top Doc ===
+        faiss_images = entry.get("faiss_images", [])
+        faiss_sources = entry.get("faiss_sources", [])
+        if faiss_images and faiss_sources:
+            top_doc = faiss_sources[0][0]
+            st.subheader(f"🖼️ Images from: {top_doc}")
+            for meta in faiss_images:
+                if meta.get("original_doc") == top_doc:
+                    img_path = meta.get("extracted_image_path")
+                    if img_path and os.path.exists(img_path):
+                        st.image(img_path, caption=meta.get("caption", ""), use_container_width=True)
+
+        # === Show Document Sources with Download Buttons ===
+        st.subheader("📄 Document Sources:")
+        for i, (docname, snippet, path) in enumerate(faiss_sources, 1):
+            col1, col2 = st.columns([0.85, 0.15])
+            with col1:
                 st.markdown(f"**{i}. {docname}**\n\n{snippet}")
+            with col2:
+                if path and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        st.download_button(
+                            label="⬇️",
+                            data=f,
+                            file_name=os.path.basename(path),
+                            key=f"download_history_{i}"
+                        )
 
     elif entry["route"] == "search":
         if entry.get("general_summary"):
@@ -1322,6 +1429,9 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     ppt_buffer = generate_ppt(entry)
     st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
+
+
+
 
 
 
