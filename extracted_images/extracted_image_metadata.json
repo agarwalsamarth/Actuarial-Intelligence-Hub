@@ -1,0 +1,22 @@
+[
+    {
+        "filename": "Earmark Template.docx_fallback_docx_img_5.png",
+        "original_doc": "Earmark Template.docx",
+        "original_doc_path": "Documents/Earmark Template.docx",
+        "extracted_image_path": "extracted_images/Earmark Template.docx_fallback_docx_img_5.png",
+        "caption": "",
+        "image_id": "fallback_docx_5",
+        "page_number": null,
+        "doc_type": "extracted_image"
+    },
+    {
+        "filename": "Enhanced_Allocation.pptx_fallback_pptx_img_0.png",
+        "original_doc": "Enhanced_Allocation.pptx",
+        "original_doc_path": "Documents/Enhanced_Allocation.pptx",
+        "extracted_image_path": "extracted_images/Enhanced_Allocation.pptx_fallback_pptx_img_0.png",
+        "caption": "",
+        "image_id": "fallback_pptx_0",
+        "page_number": 1,
+        "doc_type": "extracted_image"
+    }
+]
