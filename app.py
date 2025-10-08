@@ -1050,7 +1050,7 @@ graph_builder.add_edge("faissdb", END)
 agent_graph = graph_builder.compile()
 
 # ---- Streamlit UI ----
-st.title("\U0001F9E0 Agentic AI Assistant (Insurance)")
+st.title("\U0001F9E0 Project ASTRA")
 
 
 def format_date_label(chat_date: date) -> str:
@@ -1435,6 +1435,7 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     ppt_buffer = generate_ppt(entry)
     st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
+
 
 
 
