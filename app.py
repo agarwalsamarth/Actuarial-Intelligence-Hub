@@ -2051,7 +2051,7 @@ graph_builder.add_edge("faissdb", END)
 agent_graph = graph_builder.compile()
 
 # ---- Streamlit UI ----
-st.title("\U0001F9E0 Agentic AI Assistant (Insurance)")
+st.title("\U0001F9E0 Project ASTRA")
 
 
 def format_date_label(chat_date: date) -> str:
@@ -2661,6 +2661,7 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
+
 
 
 
