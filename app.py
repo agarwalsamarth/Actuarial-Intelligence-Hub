@@ -24,11 +24,25 @@ import json
 from datetime import date, timedelta
 from pptx import Presentation
 from pptx.util import Inches, Pt
-from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
-from pptx.dml.color import RGBColor
-import io
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import OpenAIEmbeddings
+import tempfile
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.text.paragraph import Paragraph
+from docx.table import Table
+from docx.table import Table as DocxTable
+import tempfile
+import uuid
+from docx.table import Table as DocxTable
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+import numpy as np
+from pathlib import Path
+from io import BytesIO
+import base64
+from time import sleep
+from urllib.parse import urlparse
 
 
 st.set_page_config(layout="wide")
@@ -81,16 +95,38 @@ class GraphState(TypedDict):
     user_prompt: str
     doc_loaded: bool
     document_path: Optional[str]
+
+    # Prompts
     vanna_prompt: Optional[str]
     fuzzy_prompt: Optional[str]
+
+    # Routing
     route: Optional[str]
+
+    # SQL-related
     sql_result: Optional[pd.DataFrame]
-    web_links: Optional[List[str]]
+    sql_query: Optional[str]
+
+    # Document-related
     updated_doc_path: Optional[str]
+    header_candidate: Optional[str]          # fuzzy-matched header
+    table_candidate_index: Optional[int]     # fuzzy-matched table index
+    header_updated: Optional[str]            # final confirmed header
+    table_index_updated: Optional[int]       # final confirmed table index
+    #candidate_tables: Optional[list[dict]]  # store top-n candidates
+    updated_doc_key: Optional[str]           # unique Streamlit key for download button
+    preview_df: Optional[list[dict]]         # serializable preview rows (list of dicts): table from doc
+    preview_df_columns: Optional[list[str]]  # column names for preview_df
+
+    # External search
+    web_links: Optional[List[str]]
+
+    # Visualization / summaries
     chart_info: Optional[dict]
     comparison_summary: Optional[str]
     general_summary: Optional[str]
-    sql_query: Optional[str]
+
+    # FAISS Knowledge base
     faiss_summary: Optional[str]
     faiss_sources: Optional[list[tuple[str, str]]]
     faiss_images: Optional[list[dict]]
@@ -147,22 +183,44 @@ PnC_Data Table:
 """
 
 STATE_KEYS_SET_AT_ENTRY = [
-    "user_prompt", 
-    "doc_loaded", 
-    "document_path", 
-    "vanna_prompt", 
-    "fuzzy_prompt",
-    "route",
-    "sql_result",
-    "sql_query",
-    "web_links",
-    "updated_doc_path",
-    "chart_info",
-    "comparison_summary",
-    "general_summary",
-    "faiss_summary", 
-    "faiss_sources",
-    "faiss_images"
+#     "user_prompt", 
+#     "doc_loaded", 
+#     "document_path", 
+
+#     # Prompts
+#     "vanna_prompt", 
+#     "fuzzy_prompt",
+
+#     # Routing
+#     "route",
+
+#     # SQL-related
+#     "sql_result",
+#     "sql_query",
+
+#     # Document-related
+#     "updated_doc_path",
+#     "header_candidate",
+#     "table_candidate_index",
+#     "header_updated",
+#     "table_index_updated",
+#     "candidate_tables",
+#     "updated_doc_key",
+#     "preview_df",   
+#     "preview_df_columns",
+
+#     # External search
+#     "web_links",
+
+#     # Visualization / summaries
+#     "chart_info",
+#     "comparison_summary",
+#     "general_summary",
+
+#     # FAISS Knowledge base
+#     "faiss_summary", 
+#     "faiss_sources",
+#     "faiss_images"
 ]
 
 
@@ -202,9 +260,7 @@ class RouterNode(Runnable):
 
 
         3. "document" ONLY if a document is uploaded (Document Uploaded = yes) AND the question involves updating/reading a document.
-        -If the route is "document", include:
-            - "vanna_prompt": an SQL-style question to query structured data.
-            - "fuzzy_prompt": a natural language description of the header or table to update.
+        -If the route is "document", DO NOT include vanna_prompt or fuzzy_prompt.
 
         
         4. Choose "search" if:
@@ -234,8 +290,14 @@ class RouterNode(Runnable):
             - "competitive advantage in reserves"
             - "our severity vs others"
             - "compare to S&P average" / "AM Best stats" / "regulatory benchmark"
-        -(e.g.,User Prompt is "Compare IBNR trends with industry benchmarks for exposure year 2025 ")
-        - Return Vanna_prompt as well as "Show IBNR trends for exposure year 2025"
+        -(e.g.,
+         1. If User_Prompt is "Compare IBNR trends with industry benchmarks for exposure year 2025"
+            - Return Vanna_prompt: "Show IBNR trends for exposure year 2025"
+         2. If User_Prompt is "what are the incurred loss trends as compared to axaxl competitors"
+            - Return Vanna_prompt: "what are the incurred loss trends"
+         3. If User_Prompt is "what are the expected loss trends as compared to market average"
+            - Return Vanna_prompt: "Swhat are the ultimate loss trends"
+
         -Do not include fuzzy_prompt
         -Only include relevant columns in vanna_prompt. Do not include ClaimNumber or ID columns unless the user specifically asks for them.
 
@@ -263,8 +325,6 @@ class RouterNode(Runnable):
         For Document:
         {{
             "route": "document",
-            "vanna_prompt": "SELECT policy_id, total_loss FROM policies WHERE year = 2024",
-            "fuzzy_prompt": "Update the table under 'Loss Overview' for 2024"
         }}
 
         For Comp:
@@ -303,8 +363,11 @@ class RouterNode(Runnable):
             st.error(f"[RouterNode] LLM call failed: {e}")
             parsed = {"route": "search"}
 
-        # ✅ Enforce safety: remove vanna_prompt if not 'document' or 'comp'
-        if parsed.get("route") not in ["document", "comp", "sql", "faissdb"]:
+        # ✅ Enforce safety: remove vanna_prompt
+        if parsed.get("route") == "document":
+            parsed["fuzzy_prompt"] = state["user_prompt"]   # alias
+            parsed["vanna_prompt"] = None                   # will be set later
+        elif parsed.get("route") not in ["sql", "comp", "faissdb"]:
             parsed["vanna_prompt"] = None
             parsed["fuzzy_prompt"] = None
 
@@ -316,7 +379,13 @@ class RouterNode(Runnable):
             "route": parsed.get("route"),
             "vanna_prompt": parsed.get("vanna_prompt"),
             "fuzzy_prompt": parsed.get("fuzzy_prompt"),
-            "chart_info": chart_info
+            "chart_info": chart_info,
+
+            # Reset doc-specific keys at routing
+            "header_candidate": None,
+            "table_candidate_index": None,
+            "header_updated": None,
+            "table_index_updated": None
         }
     
 # ---- Vanna SQL Node ----
@@ -421,32 +490,64 @@ def vanna_node(state: GraphState) -> GraphState:
     }
 
 
+#-----------------------------WEB SEARCH AGENT-----------------------------------
 # --Enhance Google Search--
+DOMAINS = {
+    "core": [
+        "swissre.com", "munichre.com", "amwins.com", "willistowerswatson.com",
+        "insurancebusinessmag.com", "businessinsurance.com",
+        "insuranceinsider.com", "iii.org",  # Insurance Information Institute
+        "deloitte.com", "mckinsey.com", "bcg.com"
+    ],
+    "regulators": [
+        "irdai.gov.in", "naic.org", "eba.europa.eu", "eiopa.europa.eu"
+    ],
+    "market_news": [
+        "dowjones.com", "wsj.com", "reuters.com", "bloomberg.com",
+        "financialtimes.com", "economist.com"
+    ],
+}
 
-def enhance_query(prompt: str) -> str:
-    insurance_keywords = [
-        "insurance", "insurer", "claim", "premium", "underwriting",
-        "policy", "fraud", "broker", "actuary", "reinsurance", "coverage", "Actuarial", "reserving","P&L","Profit and Loss"
-    ]
-    
-    if any(keyword in prompt.lower() for keyword in insurance_keywords):
-        base_query = prompt
-    else:
-        base_query = f"In the insurance industry, {prompt}"
-    
-    # Add site filters to target trusted insurance-related domains
-    domain_filter = "site:deloitte.com OR site:irdai.gov.in OR site:insurancebusinessmag.com OR site:swissre.com"
-    
-    return f"{base_query} {domain_filter}"
- 
+INSURANCE_SYNONYMS = {
+    "loss ratio": ["combined ratio", "claims ratio"],
+    "reserve": ["ibnr", "loss reserves", "case reserve", "ultimate loss"],
+    "premium": ["written premium", "earned premium", "gross premium", "gwp"],
+    "social inflation": ["nuclear verdicts", "litigation costs", "jury awards"],
+}
+
+
+def _domain_filter(for_news: bool) -> str:
+    # Bias to relevant sources; include market_news when for_news = True
+    domains = DOMAINS["core"] + DOMAINS["regulators"] + (DOMAINS["market_news"] if for_news else [])
+    return " OR ".join([f"site:{d}" for d in domains])
+
+
+def enhance_query(prompt: str) -> dict:
+    """
+    Builds query and mode.
+    Returns: {"q": <string>, "for_news": bool}
+    """
+    p = prompt.strip()
+    lower = p.lower()
+#   for_news = any(w in lower for w in ["news", "today", "latest", "update", "trend", "q3", "q4", "fy", "quarter", "yoy", "benchmark"])
+    for_news = "TRUE"
+
+    insurance_tokens = ["insurance", "insurer", "claim", "premium", "underwriting", "actuarial", "reinsurance", "coverage", "reserving"]
+    base_query = p if any(t in lower for t in insurance_tokens) else f"in insurance industry: {p}"
+    sites = _domain_filter(for_news)
+
+    q = f'{base_query} ({sites})'
+    return {"q": q, "for_news": for_news}
+
 # --- SerpAPI Node --- 
 def serp_node(state: GraphState) -> GraphState:
-    query = enhance_query(state["user_prompt"])
+    built = enhance_query(state["user_prompt"])
+    query, for_news = built["q"], built["for_news"]
 
     search = GoogleSearch({
-        "q": query,
-        "api_key": os.getenv("SERPAPI_API_KEY"),
-        "num": 5
+    "q": query,
+    "api_key": os.getenv("SERPAPI_API_KEY"),
+    "num": 5
     })
     results = search.get_dict()
 
@@ -463,23 +564,26 @@ def serp_node(state: GraphState) -> GraphState:
                 summaries.append(snippet)
 
     if not links:
-        links = ["No insurance-related results found or API limit reached."]
+        links = ["No high-quality results found (try broader query or remove filters)."]
         summaries = [""]
 
-    # ✨ Add LLM-generated general summary with numeric insights
-    combined_text = "\n".join(summaries)
+    # Build LLM prompt
+    combined_text = "\n".join([f"[{i+1}] {s}" for i, s in enumerate(summaries)])
 
-    # Build conditional prompt for COMP vs SERP node - COMP includes SQL snippet
-    if "sql_query" in state and state["sql_query"]:
-        sql_snippet = f"\n🧾 Internal SQL Query:\n{state['sql_query']}"
-    else:
-        sql_snippet = ""
+    sql_in_context = isinstance(state.get("sql_result"), pd.DataFrame) and not state["sql_result"].empty
+    internal_sql_top5 = state["sql_result"].head(5).to_markdown(index=False) if sql_in_context else ""
 
-    if "sql_result" in state and isinstance(state["sql_result"], pd.DataFrame):
-        sql_snippet += f"\n\n📊 Top 5 rows of SQL Output:\n{state['sql_result'].head(5).to_markdown(index=False)}"
+    # 2) EXTERNAL: fetch market benchmark only from the web
+    #    We override the user_prompt for the search node so it explicitly asks for market/industry averages externally.
+    ext_prompt = f"""
+    Market / industry average IBNR trend (P&C) for recent 1–5 years, external sources only.
+    Prefer credible sources (Dow Jones/WSJ/Reuters/BusinessInsurance/InsuranceInsider/regulators/reinsurers).
+    Use USD, %, ratios if available.
+    Original user context: {state.get('user_prompt','')}
+    """.strip()
 
-    # ✅ If COMP node passed Vanna data
-    if sql_snippet:
+
+    if sql_in_context:
         general_summary_prompt = f"""
         You are an insurance and actuarial analyst comparing internal company data with external web results.
 
@@ -489,62 +593,55 @@ def serp_node(state: GraphState) -> GraphState:
         {state['sql_query'] if 'sql_query' in state else ''}
 
         📊 Top 5 rows of SQL Output (reference only, do not display):
-        {state['sql_result'].head(5).to_markdown(index=False) if isinstance(state['sql_result'], pd.DataFrame) else ''}
+        SQL: {state.get('sql_query','')}
+        Top rows:
+        {internal_sql_top5}
 
-        ---
-
-        Now, using only the following external web snippets, write a summary:
-
-        🔍 Web Snippets:
+        External snippets (numbered):
         {combined_text}
-
-        ---
-
+        
         User Prompt:
-        "{state['user_prompt']}"
-
+        "{ext_prompt}"
 
         🔽 Your Task:
         - Summarize **only what is found in the external data**
         - DO NOT display the internal SQL data or repeat it
-        - Be concise, no more than **6–8 lines**
+        - Be concise, no more than **6-8 lines**
         - Include **percentages, currency, loss ratios, IBNR**, and other KPIs found in the web
         - Avoid repeating full articles or sentences
+        - Mention key **KPIs** (e.g., IBNR, premiums, loss ratios, reserves)
+        -Focus more on numerical insights
 
         Output format:
-        1. 📌 Start with a summary of overall findings.
-        2. 🔢 Then list 3–4 **quantitative highlights**.
+        1. 📌 Start with a summary of overall findings with around 5-6 lines.
+        2. 🔢 Then list 6–7 **quantitative highlights**.
         3. 💬 End with any notable quote or number from a source if applicable.
         4. Can include a table with numerical insights as well, but not the internal data or tabular data. Only if you found it in external data.
         """
     else:
-        # 🔁 Fall back to generic summary for plain search node
         general_summary_prompt = f"""
-        You are an insurance and actuarial analyst.
-
         Your task is to extract **concise and numerically rich insights** from the following web snippets, in response to this user query:
 
         "{state['user_prompt']}"
 
-        Snippets:
+        External snippets (numbered):
         {combined_text}
 
-        Your summary should:
-        - Be structured and no more than **6–8 lines**
+       Your summary should:
+        - Be structured and no more than **10–12 lines**
         - Include **percentages**, **currency values**, **ratios**, **dates**, and **growth trends**
         - Mention key **KPIs** (e.g., IBNR, premiums, loss ratios, reserves)
         - Avoid repeating the snippets. Instead, **synthesize them**
         - If no numbers are found, say so explicitly
 
         Output format:
-        1. 📌 Start with a summary of overall findings.
+        1. 📌 Start with a summary of overall findings with around 5-6 lines.
         2. 🔢 Then list 3–4 **quantitative highlights**.
         3. 💬 End with any notable quote or number from a source if applicable.
         4. Can include a table with numerical insights as well
         """
 
-    general_summary = call_llm(general_summary_prompt)
-    print("General summary generated:", general_summary)
+    general_summary = call_llm(general_summary_prompt).strip()
 
     return {
         **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
@@ -552,34 +649,57 @@ def serp_node(state: GraphState) -> GraphState:
         "general_summary": general_summary
     }
 
-# -------------Comp Node------------------
+
+# ------------------ COMP Node  -----------------
+# COMPARISON_TERMS = [
+#     "market average", "industry average", "industry", "benchmark", "benchmarks",
+#     "peer", "peers", "peer set", "vs", "versus", "against", "relative to",
+#     "compare", "comparison", "compared to", "market trend", "external"
+# ]
+
 def comp_node(state: GraphState) -> GraphState:
-    # Step 1: Run Vanna SQL
-    vanna_prompt = state.get("vanna_prompt") or state["user_prompt"]
-    sql_query = vn_model.generate_sql(vanna_prompt)
+    # 1) INTERNAL: build a safe Vanna prompt (internal-only)
+
+    schema_desc = get_schema_description('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
+    raw_prompt = state.get("vanna_prompt") or state["user_prompt"]
+
+    # Build a strict instruction block to prevent introspection
+    instruction_block = (
+        "IMPORTANT: You are only allowed to use the schema below — you must NOT inspect or read any rows from the database. "
+        "Do NOT request sample rows. Do NOT attempt to access the database for schema discovery. "
+        "Using only the schema below, produce a single valid SQL query (ANSI SQL or dialect I specify if needed) that returns "
+        "Return only the SQL; do not include explanation text."
+    )
+
+    combined_prompt = f"{schema_desc}\n\n{instruction_block}\n\nUser intent: {raw_prompt}\n\n"
+
+    sql_query = vn_model.generate_sql(combined_prompt)
 
     try:
         result = vn_model.run_sql(sql_query)
         if isinstance(result, pd.DataFrame):
-            parsed_result = result
+            sql_df = result
         elif isinstance(result, list):
-            parsed_result = pd.DataFrame(result)
+            sql_df = pd.DataFrame(result)
         else:
-            parsed_result = pd.DataFrame([{"Result": str(result)}])
+            sql_df = pd.DataFrame([{"Result": str(result)}])
     except Exception as e:
-        parsed_result = pd.DataFrame([{"Error": f"SQL Execution failed: {e}"}])
-    
-    sql_df = parsed_result
-    
-    # Step 2: Run Serp Search
-    serp_result = serp_node({**state, "sql_query": sql_query, "sql_result": sql_df})
-    web_links = serp_result.get("web_links")
+        sql_df = pd.DataFrame([{"Error": f"SQL Execution failed: {e}"}])
 
+    serp_result = serp_node({**state, "sql_query": sql_query, "sql_result": sql_df})
+
+    web_links = serp_result.get("web_links", [])
     external_summary = serp_result.get("general_summary", "")
 
-    # Step 3: Generate comparison summary using LLM
-    summary_prompt = f"""
-    You are an actuarial analyst comparing internal structured data with external insurance insights.
+    # 3) COMPARISON: clear separation + citations
+    comparison_prompt = f"""
+    You are an Benchmarking actuarial analyst. Compare OUR internal IBNR trend to EXTERNAL market/industry benchmarks.
+    Rules:
+    - Use INTERNAL SQL only for our numbers; do NOT infer market values from internal data.
+    - Use EXTERNAL WEB snippets only for market/industry values; if no numeric market average is found, say so explicitly.
+    - Put all money in **USD**, include **%/ratios/dates** where present.
+    - Append [i] citations for any external metric where i refers to the snippet index (shown below).
+    - If sources disagree, note the discrepancy briefly.
 
     Your job is to:
     1. Analyze differences, similarities, and gaps between internal company data and external web sources.
@@ -588,35 +708,35 @@ def comp_node(state: GraphState) -> GraphState:
     - Premiums, Loss Ratios
     - Exposure Years, Percent changes
 
-    3. Highlight:
+    3. Focus more on:
     - Trends (increases/decreases)
     - Matching vs. diverging figures
     - Numerical differences or % differences
 
-    🧾 Internal SQL Output (Top 5 rows, tabular format):
+    Our internal (context only; do not reveal raw table):
+    SQL: {sql_query}
+    Top rows (context only):
     {sql_df.head(5).to_markdown(index=False) if isinstance(sql_df, pd.DataFrame) else str(sql_df)}
 
-    🌐 External Web Insights:
-    {chr(10).join([f"- {title}: {summary[:200]}..." for title, summary in web_links])}
+    External snippets (numbered):
+    {chr(10).join([f"[{i+1}] {s}" for i, (_, s) in enumerate(web_links)])}
 
-    💬 General Summary:
+    Task:
+    1) 5–7 lines overview (internal vs market).
+    2) 3–5 bullets with side-by-side contrasts (Our vs Market) using USD/%/ratios and [citation] only for external numbers.
+    3) 1 “watch item” (e.g., social inflation, rate adequacy, reserving pressure) if relevant.
+
+    General external synthesis to leverage (do not copy verbatim; keep citations): 
     {external_summary}
-
-    Return your final answer as a **clearly structured comparison**.
-    Prefer a short table or bullet points with side-by-side numbers wherever appropriate.
-    Start with a one-liner summary, then details.
     """
-
-    #summary_prompt += f"\n\nGeneral Summary from external web links:\n{external_summary}"
-    
-    comparison_summary = call_llm(summary_prompt)
+    comparison_summary = call_llm(comparison_prompt).strip()
 
     return {
         **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
         "sql_result": sql_df,
         "sql_query": sql_query,
         "web_links": web_links,
-        "general_summary": serp_result.get("general_summary", ""),
+        "general_summary": external_summary,
         "comparison_summary": comparison_summary
     }
 
@@ -677,81 +797,545 @@ def faissdb_node(state: GraphState) -> GraphState:
 
 
 
+#-------------------------DOCUMENT NODE-------------------------------
 
-# ---- Document Table Update Node ----
-def document_node(state: GraphState) -> GraphState:
-    doc_path = state['document_path']
-    if not doc_path or not state.get("vanna_prompt"):
-        return {
-        **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
-        "updated_doc_path": None
-    }
+# ----------------------------
+# 🤖 Ollama Fuzzy Header Match
+# ----------------------------
+def get_target_header_and_table(state: GraphState) -> GraphState:
 
+    """
+    Uses OpenAI LLM to identify the most relevant header and table from the document,
+    based on the user's instruction (fuzzy_prompt or user_prompt).
+    Updates GraphState with header_candidate and table_candidate_index.
+    """
+    
+
+    doc_path = state.get("document_path")
+    if not doc_path:
+        st.error("❌ No document path found in state.")
+        return state
+
+    # Load doc and extract structure
     doc = Document(doc_path)
+    structure = extract_structure(doc)
+    structure_str = stringify_structure(structure)
 
-    structure_string = ""
-    header = None
-    header_table_map = {}
-
-    for para in doc.paragraphs:
-        if para.style.name.startswith("Heading"):
-            header = para.text.strip()
-            structure_string += f"\n# {header}"
-            header_table_map[header] = []
-        elif header:
-            header_table_map[header].append(len(header_table_map[header]))
-
-    for idx, table in enumerate(doc.tables):
-        cols = [cell.text.strip() for cell in table.rows[0].cells]
-        structure_string += f"\n- Table {idx}: {len(table.rows)} rows x {len(cols)} columns, Columns: {cols}"
+    # Choose prompt (prefer fuzzy_prompt if available)
+    instruction = state.get("user_prompt")
 
     prompt = f"""
-        You are helping identify the correct table to update in a Word document.
-        Each table has: index, rows x cols, and list of column headers.
+    You are helping identify the correct table to update in a Word document.
 
-        Document structure:
-        {structure_string}
+    The document contains several sections. Each section has a header and a list of tables.
+    Each table has:
+    - a table index (starting from 0 under that header),
+    - the number of rows and columns,
+    - and the list of column headers (which might vary slightly across documents).
 
-        Instruction:
-        \"\"\"{state['fuzzy_prompt']}\"\"\"
+    Here is the document structure:
+    {structure_str}
 
-        Return strictly in JSON:
-        {{ "header_text": "...", "table_index_under_header": 0 }}
+    The user's instruction is:
+    \"\"\"{instruction}\"\"\"
+
+    Rules:
+    - Match the most relevant headers and tables to the instruction (fuzzy allowed).
+    - User's instruction might have columns mentioned as well along with headers. 
+      SO use them to find the exact table in case there are multiple tables under the same header.
+    - If multiple tables exist under a header, rank them by column schema similarity. And fetch the most similar one.
+
+    Return a single JSON object exactly in this form:
+    {{"header_text": "Exact header from document", "table_index_under_header": 0}}
+
+    If no good match exists, return {{}}.
     """
-    llm_output = call_llm(prompt)
-    json_match = re.search(r'{.*}', llm_output, re.DOTALL)
-    parsed = json.loads(json_match.group()) if json_match else {"header_text": list(header_table_map)[0], "table_index_under_header": 0}
 
-    # 💡 Generate SQL via Vanna (clean)
     try:
-        sql_query = vn_model.generate_sql(state["vanna_prompt"])
-        vanna_output = vn_model.run_sql(sql_query)
+        response = call_llm(prompt)
+        st.write(response)
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if not match:
+            # no parseable JSON
+            return state
+        parsed = json.loads(match.group())
+        if not parsed:
+            return state
+
+        header_text = parsed.get("header_text")
+        table_idx = parsed.get("table_index_under_header")
+
+        # validate
+        if header_text is None or table_idx is None:
+            return state
+
+        # set in state
+        state["header_candidate"] = header_text
+        state["table_candidate_index"] = int(table_idx)
+        #state["candidate_tables"] = [{"header_text": header_text, "table_index_under_header": int(table_idx)}]
+        return state
+
+    except Exception:
+        # on any failure, return state unchanged
+        return state
+
+# ----------------------------
+# 📄 Document Parsing
+# ----------------------------
+def extract_structure(doc: "Document") -> list:
+    """
+    Walk doc.element.body and return a list of sections:
+      [{"header": <str>, "tables": [Table, ...]}, ...]
+    If a table appears before the first heading, its section header will be "NO_HEADER".
+    """
+    structure = []
+    current_header = None
+
+    for element in doc.element.body:
+        if isinstance(element, CT_P):
+            para = Paragraph(element, doc)
+            # guard for paragraphs without style
+            style_name = None
+            try:
+                style_name = para.style.name if para.style else None
+            except Exception:
+                style_name = None
+            if style_name and style_name.startswith("Heading"):
+                current_header = para.text.strip()
+                structure.append({"header": current_header, "tables": []})
+        elif isinstance(element, CT_Tbl):
+            table = Table(element, doc)
+            if current_header is None:
+                current_header = "NO_HEADER"
+                structure.append({"header": current_header, "tables": []})
+            structure[-1]["tables"].append(table)
+
+    return structure
+
+def stringify_structure(structure: list, max_chars: int = 3000) -> str:
+    """
+    Turn `structure` into a compact text describing each header and its tables:
+    - header text
+    - number of tables
+    - for each table: rows, cols, first-row headers (up to 6)
+    """
+    summary = []
+    for sec in structure:
+        header = sec.get("header", "")
+        tables = sec.get("tables", [])
+        sec_lines = [f"HEADER: {header} (tables: {len(tables)})"]
+        for ti, tbl in enumerate(tables):
+            try:
+                rows = len(tbl.rows)
+                cols = len(tbl.columns)
+                # grab first row texts as candidate column names (if exists)
+                first_row = []
+                if rows > 0:
+                    first_row = [cell.text.strip().replace("\n", " ")[:60] for cell in tbl.rows[0].cells]
+                sec_lines.append(f"  - Table {ti}: rows={rows}, cols={cols}, cols_sample={first_row[:6]}")
+            except Exception:
+                sec_lines.append(f"  - Table {ti}: (could not introspect)")
+        summary.append("\n".join(sec_lines))
+
+    out = "\n\n".join(summary)
+    if len(out) > max_chars:
+        return out[:max_chars] + " ... (truncated)"
+    return out
+
+
+# ----------------------------
+# 🔁 Replace Table with Formatting
+# ----------------------------
+def get_column_widths(table: "Table") -> list:
+    """
+    Return a list of column widths (raw values) if available, else None entries.
+    Works by inspecting table._element XML. This is best-effort.
+    """
+    widths = []
+    try:
+        # each tblGrid -> gridCol elements have 'w:w' attributes in twips
+        tbl = table._element
+        gridCols = tbl.xpath(".//w:tblGrid//w:gridCol", namespaces=tbl.nsmap)
+        if gridCols:
+            for gc in gridCols:
+                w = gc.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}w")
+                if w:
+                    widths.append(int(w))
+                else:
+                    widths.append(None)
+            return widths
+    except Exception:
+        pass
+
+    # fallback: try to estimate equal widths
+    try:
+        ncols = len(table.columns)
+        if ncols > 0:
+            return [None] * ncols
+    except Exception:
+        return []
+
+    return []
+
+
+def replace_table(old_table: DocxTable, new_df: pd.DataFrame) -> DocxTable:
+    """
+    Replace `old_table` with a new table built from `new_df`, preserving style and column widths.
+
+    Approach:
+    1. Compute parent element and index of old table (xml).
+    2. Create a new table using the same python-docx container (old_table._parent.add_table).
+       That new table will be appended to the end of the container.
+    3. Insert the new table's XML element into the parent's children right AFTER the old table element.
+    4. Remove the old table's xml element.
+    5. Return the new python-docx Table object.
+
+    This avoids placing the new table before the old one (which is what happens if you insert at the same index then
+    remove the old element immediately).
+    """
+    # sanity
+    if not isinstance(new_df, pd.DataFrame):
+        new_df = pd.DataFrame(new_df)
+
+    parent = old_table._element.getparent()        # lxml element containing the table element
+    index = parent.index(old_table._element)      # index of old_table in parent children
+    widths = get_column_widths(old_table)         # best-effort widths
+    style = None
+    try:
+        style = old_table.style
+    except Exception:
+        style = None
+
+    # Create new table under same container (old_table._parent is a python-docx object that supports add_table)
+    try:
+        container = old_table._parent
+        new_table = container.add_table(rows=1, cols=len(new_df.columns))
     except Exception as e:
-        return {**state, "updated_doc_path": None, "error": f"SQL generation or execution failed: {e}"}
+        raise RuntimeError(f"Could not create new table in same container: {e}")
 
-    # 📝 Update the correct table
-    header = parsed['header_text']
-    table_idx = parsed['table_index_under_header']
-    matched_table_index = list(header_table_map[header])[table_idx]
-    table = doc.tables[matched_table_index]
+    # Apply style if available
+    if style:
+        try:
+            new_table.style = style
+        except Exception:
+            pass
 
-    # 🔁 Fill table with SQL output
-    if isinstance(vanna_output, pd.DataFrame):
-        for i, row in enumerate(vanna_output.itertuples(index=False), start=1):
-            for j, value in enumerate(row):
-                if i < len(table.rows) and j < len(table.columns):
-                    table.cell(i, j).text = str(value)
+    # Fill header row
+    for col_idx, col_name in enumerate(new_df.columns):
+        try:
+            new_table.cell(0, col_idx).text = str(col_name)
+        except Exception:
+            # ensure there are enough cells
+            pass
 
-    updated_path = "updated_doc.docx"
-    doc.save(updated_path)
+    # Fill data rows
+    for _, row in new_df.iterrows():
+        cells = new_table.add_row().cells
+        for i, val in enumerate(row):
+            try:
+                cells[i].text = "" if pd.isnull(val) else str(val)
+            except Exception:
+                pass
 
-    return {
-        **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
-        "updated_doc_path": updated_path,
+    # Apply column widths (best-effort)
+    for i, col in enumerate(new_table.columns):
+        if i < len(widths) and widths[i]:
+            for cell in col.cells:
+                try:
+                    cell.width = widths[i]
+                except Exception:
+                    pass
+
+    # Insert the new_table element into the parent right AFTER the old table element
+    # (so new_table is placed immediately below the old table, then we remove the old table)
+    parent.insert(index + 1, new_table._element)
+
+    # Now remove the old table element
+    parent.remove(old_table._element)
+
+    return new_table
+
+
+def render_doc_results(state: GraphState):
+    st.write("DEBUG: ENTER render_doc_results")
+    st.write("DEBUG: state keys in render:", list(state.keys()))
+    st.subheader("📄 Document Update Summary (render_doc_results)")
+
+    header = state.get("header_updated")
+    table_idx = state.get("table_index_updated")
+
+    st.markdown(f"**Header:** {header}")
+    st.markdown(f"**Table index:** {table_idx}")
+
+    if state.get("sql_query"):
+        st.code(state["sql_query"], language="sql")
+
+    sql_df = state.get("sql_result")
+    st.write("DEBUG: sql_df type in render:", type(sql_df))
+    if isinstance(sql_df, pd.DataFrame):
+        st.dataframe(sql_df)
+    else:
+        st.write(sql_df)
+
+    if state.get("updated_doc_path"):
+        st.write("DEBUG: updated_doc_path exists:", state["updated_doc_path"])
+        try:
+            with open(state["updated_doc_path"], "rb") as f:
+                st.download_button("📥 Download Updated Document", f, file_name="updated.docx")
+        except Exception as e:
+            st.write("DEBUG: failed to open updated_doc_path:", e)
+
+
+
+def run_sql_and_update_doc(
+    state: GraphState,
+    user_prompt: str,
+    old_table: Table,
+    header: str,
+    table_idx: int,
+    doc: Document
+) -> GraphState:
+    """
+    Generates a Vanna prompt, runs SQL, replaces the table in the document,
+    saves updated doc, and returns updated GraphState.
+    """
+
+    # --- Step 1: Build Vanna Prompt using LLM ---
+    col_headers = [cell.text.strip() for cell in old_table.rows[0].cells]
+    st.write("col_headers")
+    st.write(col_headers)
+    schema = get_schema_description('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
+
+    #The user has asked: "{user_prompt}". 
+    #User's instruction might have columns mentioned as well along with headers. Ignore those column names.
+
+    vanna_prompt_instruction = f"""
+    You are an assistant that generates a natural language prompt for Vanna AI that Vanna will convert to SQL query in future.
+
+
+    The table extracted from the Word document has these columns:
+    {', '.join(col_headers)}.
+
+    Please generate a clear SQL data retrieval prompt in natural language that include all the columns found in the word document explicitly.
+    Refer to the below mentioned stuff for sql database schemas, columns and for better accuracy
+    - database schema:
+    {schema}
+    - Use this additional documentation to better understand column meanings:
+    {documentation}
+    - Additionally, here are some examples of SQL-style questions and their corresponding queries (QSPairs):
+    {qs_examples}
+
+    -Example: if the headers found from the word document table are "Exposure Year", "Incurred Loss", "Ultimate Loss", 
+    then your output shoud be "Show exposure year wise incurred loss and ultimate loss"
+    - And always try to group by on possible dimension columns or non-numeric columns.
+    """
+
+    #st.write(vanna_prompt_instruction)
+    try:
+        vanna_prompt = call_llm(vanna_prompt_instruction)
+        st.write("vanna_prompt")
+        st.write(vanna_prompt)
+    except Exception as e:
+        raise RuntimeError(f"call_llm failed: {e}")
+
+    state["vanna_prompt"] = vanna_prompt
+
+    # --- Step 2: Generate SQL + Run ---
+    try:
+        sql_query = vn_model.generate_sql(vanna_prompt)
+        st.write(sql_query)
+        result = vn_model.run_sql(sql_query)
+        new_df = pd.DataFrame(result) if not isinstance(result, pd.DataFrame) else result
+    except Exception as e:
+        st.error(f"❌ SQL execution failed: {e}")
+        return state
+
+    # --- Step 3: Replace Table in Doc ---
+    try:
+        replace_table(old_table, new_df)
+    except Exception as e:
+        raise RuntimeError(f"replace_table failed: {e}")
+
+    # ---Step 4: save updated doc to temp file
+    tmp_path = os.path.join(tempfile.gettempdir(), f"updated_{uuid.uuid4().hex}.docx")
+    try:
+        doc.save(tmp_path)
+        download_key = f"download_updated_{uuid.uuid4().hex}"
+        state["updated_doc_key"] = download_key
+    except Exception as e:
+        raise RuntimeError(f"Saving updated document failed: {e}")
+    
+    # --- Step 4: Update State ---
+    state = {
+        **state,
+        "sql_result": new_df,
+        "sql_query": sql_query,
+        "updated_doc_path": tmp_path,
         "header_updated": header,
-        "table_index_updated": matched_table_index
+        "table_index_updated": table_idx,
+        "vanna_prompt": vanna_prompt
     }
 
+    return state
+
+
+def document_node(state: GraphState) -> GraphState:
+    """
+    Automated document node (single-candidate flow).
+    Uses existing helpers:
+      - get_target_header_and_table(state) -> should set header_candidate & table_candidate_index
+      - extract_structure(doc)
+      - stringify_structure(structure)
+      - run_sql_and_update_doc(state, user_prompt, old_table, header, table_idx, doc)
+      - replace_table(old_table, new_df) (used by run_sql_and_update_doc)
+    Flow:
+      1. Load persisted graph_state
+      2. Call fuzzy match to populate header_candidate/table_candidate_index
+      3. Locate the table object, show preview
+      4. Run run_sql_and_update_doc (performs vanna SQL + replace + save)
+      5. Persist state and render final outputs + download button
+    """
+
+    # 0. Prefer persisted graph_state if present (so results survive reruns)
+    persisted = st.session_state.get("graph_state")
+    if persisted:
+        # merge persisted over incoming state so persisted values have precedence
+        state = {**state, **persisted}
+
+    # Basic checks
+    user_prompt = state.get("user_prompt")
+    doc_path = state.get("document_path")
+
+    if not user_prompt:
+        st.error("No user prompt found. Submit the query form first.")
+        return state
+    if not doc_path:
+        st.error("No document uploaded. Upload and submit the form first.")
+        return state
+
+    # # If already ran earlier and results exist, just render them and return
+    # if state.get("sql_result") is not None:
+    #     # Render summary + results + download button
+    #     #st.success("✅ Document has already been updated. Showing saved results.")
+    #     header = state.get("header_updated") or state.get("header_candidate")
+    #     table_idx = state.get("table_index_updated") or state.get("table_candidate_index")
+
+    #     if header:
+    #         st.markdown(f"**Header updated / matched:** {header}")
+    #     if table_idx is not None:
+    #         st.markdown(f"**Table index:** {table_idx}")
+
+    #     if state.get("sql_query"):
+    #         st.subheader("SQL Query")
+    #         st.code(state["sql_query"], language="sql")
+
+    #     st.subheader("SQL Result")
+    #     sql_df = state.get("sql_result")
+    #     if isinstance(sql_df, pd.DataFrame):
+    #         st.dataframe(sql_df)
+    #     else:
+    #         st.write(sql_df)
+
+    #     updated_path = state.get("updated_doc_path")
+    #     if updated_path and os.path.exists(updated_path):
+    #         with open(updated_path, "rb") as f:
+    #             st.download_button("📥 Download Updated Document", f, file_name="updated.docx")
+    #     else:
+    #         st.warning("Updated document not available (temp file may have been removed).")
+
+    #     return state
+
+
+    # 1. Load document & extract structure
+    doc = Document(doc_path)
+    structure = extract_structure(doc)
+    structure_str = stringify_structure(structure)
+
+    # 2. Get single best match (this helper should set header_candidate & table_candidate_index in state)
+    state = get_target_header_and_table(state)
+    header = state.get("header_candidate")
+    table_idx = state.get("table_candidate_index")
+
+    if not header or table_idx is None:
+        st.error("Could not automatically identify a matching header/table in the document.")
+        # optionally show the structure for debugging
+        st.subheader("Document structure (debug)")
+        st.text(structure_str[:2000] if structure_str else "No structure")
+        return state
+
+    # 3. Locate the Table object in the structure
+    try:
+        target_section = next(sec for sec in structure if sec["header"] == header)
+        old_table = target_section["tables"][table_idx]
+        
+    except Exception as e:
+        st.error(f"Failed to locate the table found by the fuzzy matcher: {e}")
+        return state
+
+    # 4. Show the matched table preview
+    #st.subheader("Matched table (preview)")
+    preview_df = pd.DataFrame([[cell.text for cell in row.cells] for row in old_table.rows])
+    #st.dataframe(preview_df)
+
+    # Store a serializable representation in state (list of dicts)
+    state["preview_df"] = preview_df.to_dict(orient="records")
+
+    # If you also want column names separately:
+    state["preview_df_columns"] = list(preview_df.columns)
+
+    
+    # 5. Run SQL + update doc automatically (show spinner while running)
+    #st.info("Generating Vanna prompt, creating SQL, executing and updating the document...")
+    #with st.spinner("Running LLM/Vanna and updating document..."):
+    try:
+        # run_sql_and_update_doc should:
+        # - generate vanna_prompt (LLM)
+        # - generate & run SQL (vn_model)
+        # - replace_table(old_table, new_df)
+        # - save updated document and return updated state with sql_result, sql_query, updated_doc_path, header_updated, table_index_updated, vanna_prompt
+        new_state = run_sql_and_update_doc(state, user_prompt, old_table, header, table_idx, doc)
+
+    except Exception as e:
+        st.error(f"Automated update failed: {e}")
+        # optionally show traceback for debugging during development
+        try:
+            import traceback
+            st.text(traceback.format_exc())
+        except Exception:
+            pass
+        return state
+
+    # 6. Persist the returned state and render final outputs
+    # Ensure we got expected keys back
+    state = {**state, **(new_state or {})}
+    st.session_state.graph_state = state
+
+    #st.success("✅ Document updated successfully.")
+    header = state.get("header_updated") or header
+    table_idx = state.get("table_index_updated") or table_idx
+
+    #st.markdown(f"**Header updated:** {header}")
+    #st.markdown(f"**Table index updated:** {table_idx}")
+
+    #if state.get("sql_query"):
+    #    st.subheader("SQL Query")
+    #    st.code(state["sql_query"], language="sql")
+
+    #st.subheader("SQL Result")
+    #sql_df = state.get("sql_result")
+    #if isinstance(sql_df, pd.DataFrame):
+    #    st.dataframe(sql_df)
+    #else:
+    #    st.write(sql_df)
+
+#    updated_path = state.get("updated_doc_path")
+#    if updated_path and os.path.exists(updated_path):
+#        with open(updated_path, "rb") as f:
+#            st.download_button("📥 Download Updated Document", f, file_name="updated.docx", key=state.get("updated_doc_key"))
+#    else:
+#        st.warning("Updated document not available (temp file may have been removed).")
+
+    return state
 
 
 def generate_follow_up_questions(user_prompt: str) -> List[str]:
@@ -843,174 +1427,591 @@ def visualize_workflow(builder, active_route=None):
     st.pyplot(plt)
 
 
+def _rows_cols_from_serialized(df_like):
+    """
+    Accepts:
+      - pandas.DataFrame
+      - dict with {"columns": [...], "rows": [...]}
+      - list[dict] (rows only)
+    Returns: (columns:list[str], rows:list[list[str]])
+    """
+    if df_like is None:
+        return [], []
+    # DataFrame
+    if isinstance(df_like, pd.DataFrame):
+        cols = list(df_like.columns)
+        rows = df_like.to_dict(orient="records")
+        return cols, [[str(row.get(c, "")) for c in cols] for row in rows]
+    # {"columns": [...], "rows": [...]}
+    if isinstance(df_like, dict) and "rows" in df_like:
+        cols = df_like.get("columns") or []
+        rows_data = df_like["rows"]
+        # if columns missing, infer from first row
+        if not cols and isinstance(rows_data, list) and rows_data:
+            cols = list(rows_data[0].keys())
+        rows = []
+        for r in rows_data or []:
+            if isinstance(r, dict):
+                rows.append([str(r.get(c, "")) for c in cols])
+            else:
+                # row already list-like
+                rows.append([str(v) for v in (r or [])])
+        return cols, rows
+    # list-of-dicts
+    if isinstance(df_like, list) and (not df_like or isinstance(df_like[0], dict)):
+        cols = list(df_like[0].keys()) if df_like else []
+        rows = [[str(r.get(c, "")) for c in cols] for r in df_like]
+        return cols, rows
+    # Fallback: treat as string
+    return ["value"], [[str(df_like)]]
+
+
+def _add_table_slide(prs, title, columns, rows, max_rows=6):
+    """
+    Adds a slide with a table safely.
+    - columns: list[str] or []
+    - rows: list[list[str]] where each row may have variable length
+    - max_rows: maximum number of data rows to show (headers + data <= max_rows)
+    """
+    layout = prs.slide_layouts[5]  # title + content
+    slide = prs.slides.add_slide(layout)
+    slide.shapes.title.text = title
+
+    # Normalize rows to list of lists of strings
+    norm_rows = []
+    for r in rows or []:
+        if isinstance(r, dict):
+            # if row is dict, map by columns if available
+            if columns:
+                norm_rows.append([str(r.get(c, "")) for c in columns])
+            else:
+                # dict -> preserve order of keys
+                norm_rows.append([str(v) for v in r.values()])
+        elif isinstance(r, (list, tuple)):
+            norm_rows.append(["" if v is None else str(v) for v in r])
+        else:
+            norm_rows.append([str(r)])
+
+    # If preview columns provided use them; otherwise infer from data
+    if columns:
+        n_cols = max(1, len(columns))
+    else:
+        # infer columns as max row length
+        n_cols = max((len(r) for r in norm_rows), default=1)
+
+    # truncate data rows to fit on slide (reserve one row for header if columns present)
+    max_data_rows = max_rows - (1 if columns else 0)
+    if max_data_rows < 0:
+        max_data_rows = 0
+    display_rows = norm_rows[:max_data_rows]
+
+    n_rows = len(display_rows) + (1 if columns else 0)
+    if n_rows == 0:
+        # nothing to show
+        return
+
+    # Create table: rows x cols
+    # Use reasonable slide area
+    left, top, width, height = Inches(0.5), Inches(1.2), Inches(8.5), Inches(3.5)
+    table_shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
+    table = table_shape.table
+
+    # Fill header if present
+    if columns:
+        for ci in range(n_cols):
+            text = columns[ci] if ci < len(columns) else ""
+            table.cell(0, ci).text = str(text)
+
+    # Fill body safely (guard indices)
+    start_row = 1 if columns else 0
+    for ri, row in enumerate(display_rows):
+        for ci in range(n_cols):
+            text = row[ci] if ci < len(row) else ""
+            table.cell(start_row + ri, ci).text = str(text)
+
+    return table
+
+
 #Exporting data to Powerpoint
 def generate_ppt(entry) -> BytesIO:
+    """
+    Generate a PowerPoint for a session entry which contains `messages`:
+    entry["messages"] = [{"role":"turn","user_prompt":..., "assistant_run": {...}, "timestamp":...}, ...]
+    Returns BytesIO.
+    """
     prs = Presentation()
-    layout = prs.slide_layouts[5]  # title + content
+    layout = prs.slide_layouts[5]
 
-    # 🧠 Title Slide
+    # Title slide for the session
     slide = prs.slides.add_slide(prs.slide_layouts[0])
     slide.shapes.title.text = "Agentic AI Report"
-    slide.placeholders[1].text = f"Prompt: {entry['prompt']}"
+    session_title = entry.get("title") or (entry.get("prompt") or "")
+    slide.placeholders[1].text = f"Session: {session_title}"
+    created = entry.get("created_at") or entry.get("timestamp") or ""
+    if created:
+        # add a small subtitle for created time if available
+        try:
+            subtitle = slide.placeholders[1]
+            subtitle.text += f"\nCreated: {created}"
+        except Exception:
+            pass
 
-    route = entry.get("route")
+    # If messages absent (defensive) - fallback to single-run fields (but user said messages always present)
+    messages = entry.get("messages", [])
+    if not messages:
+        # create a synthetic single-turn message using top-level entry fields
+        messages = [{
+            "role": "turn",
+            "user_prompt": entry.get("prompt", ""),
+            "assistant_run": {
+                "prompt": entry.get("prompt"),
+                "route": entry.get("route"),
+                "result": entry.get("result"),
+                "sql_query": entry.get("sql_query"),
+                "preview_df": entry.get("preview_df"),
+                "preview_df_columns": entry.get("preview_df_columns"),
+                "header_candidate": entry.get("header_candidate"),
+                "table_candidate_index": entry.get("table_candidate_index"),
+                "header_updated": entry.get("header_updated"),
+                "table_index_updated": entry.get("table_index_updated"),
+                "updated_doc_path": entry.get("updated_doc_path"),
+                "updated_doc_key": entry.get("updated_doc_key"),
+                "web_links": entry.get("web_links"),
+                "general_summary": entry.get("general_summary"),
+                "comparison_summary": entry.get("comparison_summary"),
+                "chart_info": entry.get("chart_info"),
+                "faiss_summary": entry.get("faiss_summary"),
+                "faiss_sources": entry.get("faiss_sources"),
+                "faiss_images": entry.get("faiss_images"),
+            },
+            "timestamp": entry.get("timestamp")
+        }]
 
-    # 🧾 SQL Query Slide (if applicable)
-    if route in ["sql", "document", "comp"] and entry.get("sql_query"):
+    # Iterate through turns in stored order (do not change order)
+    for idx, turn in enumerate(messages, start=1):
+        user_prompt = turn.get("user_prompt") or ""
+        timestamp = turn.get("timestamp") or ""
+        assistant_run = turn.get("assistant_run") or {}
+
+        # 1) Slide for the user prompt
         slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = "SQL Query"
-        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5))
+        slide.shapes.title.text = f"Turn {idx}: User Prompt"
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
         tf = box.text_frame
         tf.word_wrap = True
         p = tf.paragraphs[0]
-        p.text = entry["sql_query"]
-        p.font.size = Pt(14)
-
-    # 📊 SQL Result Table (if applicable)
-    result = entry.get("result")
-    if isinstance(result, list):
-        result = pd.DataFrame(result)
-
-    if route in ["sql", "document", "comp"] and isinstance(result, pd.DataFrame) and not result.empty:
-        df = pd.DataFrame(entry["result"]) if isinstance(entry["result"], list) else entry["result"]
-        if isinstance(df, pd.DataFrame):
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = "SQL Results"
-            rows = min(6, len(df) + 1)
-            cols = len(df.columns)
-            table = slide.shapes.add_table(rows, cols, Inches(0.5), Inches(1.2), Inches(8.5), Inches(3)).table
-            for i, col in enumerate(df.columns):
-                table.cell(0, i).text = str(col)
-            for i, row in df.head(5).iterrows():
-                for j, val in enumerate(row):
-                    table.cell(i + 1, j).text = str(val)
-
-    # 🆚 Comparison Summary
-    if route == "comp" and entry.get("comparison_summary"):
-        slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = "Comparison Summary"
-        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5))
-        tf = box.text_frame
-        tf.word_wrap = True
-        for para in entry["comparison_summary"].split("\n"):
-            if para.strip():
-                p = tf.add_paragraph()
-                p.text = para.strip()
-                p.font.size = Pt(14)
-                p.space_after = Pt(4)
-
-    # 🧠 General Summary (Search + Comp)
-    if route in ["search", "comp"] and entry.get("general_summary"):
-        slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = "General Summary"
-        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5))
-        tf = box.text_frame
-        tf.word_wrap = True
-        for para in entry["general_summary"].split("\n"):
-            if para.strip():
-                p = tf.add_paragraph()
-                p.text = para.strip()
-                p.font.size = Pt(14)
-                p.space_after = Pt(4)
-
-    # 🔗 Top Web Links (Search + Comp)
-    if route in ["search", "comp"] and entry.get("web_links"):
-        slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = "Top Web Links"
-        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5))
-        tf = box.text_frame
-        tf.word_wrap = True
-
-        for i, (link_md, summary) in enumerate(entry["web_links"], 1):
-            # Match Markdown-style link: [Title](https://link)
-            match = re.match(r"\[(.*?)\]\((.*?)\)", link_md)
-            if match:
-                title, url = match.groups()
-            else:
-                title, url = f"Link {i}", link_md  # fallback
-
-            # Add hyperlink paragraph
+        p.text = user_prompt
+        p.font.size = Pt(13)
+        if timestamp:
             p = tf.add_paragraph()
-            run = p.add_run()
-            run.text = f"{i}. {title}"
-            run.font.size = Pt(13)
-            run.hyperlink.address = url
-            p.space_after = Pt(2)
+            p.text = f"⏱ {timestamp}"
+            p.font.size = Pt(10)
 
-            # Add summary (not a hyperlink)
-            summary_p = tf.add_paragraph()
-            summary_p.text = f"    ↳ {summary[:180]}..."
-            summary_p.font.size = Pt(12)
-            summary_p.space_after = Pt(6)
+        # If assistant_run is empty, skip assistant slides
+        if not assistant_run:
+            continue
 
-    if route == "faissdb":
-        # 🧠 faiss Summary Slide
-        slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = "FAISS Summary"
+        route = assistant_run.get("route")
 
-        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5.0))
-        tf = box.text_frame
-        tf.word_wrap = True
-
-        summary_text = entry.get("faiss_summary", "No summary available.")
-        for para in summary_text.split("\n"):
-            if para.strip():
-                p = tf.add_paragraph()
-                p.text = para.strip()
-                p.font.size = Pt(14)
-                p.space_after = Pt(4)
-
-        # 📄 Source Slides (with clickable file name in title if available)
-        for i, (docname, snippet, path) in enumerate(entry.get("faiss_sources", []), 1):
-            filename = os.path.basename(path) if path else docname
+        # --- Document related (document route) ---
+        if route == "document":
             slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Source {i}: {filename}"
+            slide.shapes.title.text = f"Turn {idx}: Document Update Summary"
 
-            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(8.5), Inches(5.0))
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
             tf = box.text_frame
             tf.word_wrap = True
 
-            for para in snippet.split("\n"):
+            header = assistant_run.get("header_updated") or assistant_run.get("header_candidate")
+            table_idx = assistant_run.get("table_index_updated") or assistant_run.get("table_candidate_index")
+            updated_doc_path = assistant_run.get("updated_doc_path")
+
+            p = tf.add_paragraph()
+            p.text = f"Header Updated: {header or 'N/A'}"
+            p.font.size = Pt(14)
+
+            p = tf.add_paragraph()
+            p.text = f"Table Index Updated: {table_idx if table_idx is not None else 'N/A'}"
+            p.font.size = Pt(14)
+
+            if updated_doc_path:
+                p = tf.add_paragraph()
+                p.text = f"Updated Document Path: {updated_doc_path}"
+                p.font.size = Pt(12)
+
+            # preview table BEFORE update
+            preview_like = assistant_run.get("preview_df")
+            preview_cols = assistant_run.get("preview_df_columns")
+            prev_cols, prev_rows = [], []
+            if isinstance(preview_like, pd.DataFrame):
+                prev_cols, prev_rows = _rows_cols_from_serialized(preview_like)
+            elif isinstance(preview_like, list) and preview_like:
+                if preview_cols:
+                    prev_cols = list(preview_cols)
+                    prev_rows = [[("" if r.get(c) is None else str(r.get(c))) for c in prev_cols] for r in preview_like]
+                else:
+                    prev_cols, prev_rows = _rows_cols_from_serialized(preview_like)
+            elif isinstance(preview_like, dict):
+                prev_cols, prev_rows = _rows_cols_from_serialized(preview_like)
+
+            if prev_rows:
+                _add_table_slide(prs, f"Turn {idx}: Matched Table (Preview)", prev_cols, prev_rows, max_rows=7)
+
+        # --- SQL query slide ---
+        if assistant_run.get("sql_query"):
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = f"Turn {idx}: SQL Query"
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
+            tf = box.text_frame
+            tf.word_wrap = True
+            p = tf.paragraphs[0]
+            p.text = assistant_run.get("sql_query")
+            p.font.size = Pt(11)
+
+        # --- SQL Result (if any) ---
+        result = assistant_run.get("result")
+        df_result = None
+        if isinstance(result, list):
+            try:
+                df_result = pd.DataFrame(result)
+            except Exception:
+                df_result = None
+        elif isinstance(result, pd.DataFrame):
+            df_result = result
+
+        if df_result is not None and not df_result.empty and route in ["sql", "document", "comp"]:
+            # Add a table slide for SQL results, cap rows
+            cols, rows = _rows_cols_from_serialized(df_result)
+            if rows:
+                _add_table_slide(prs, f"Turn {idx}: SQL Results", cols, rows, max_rows=6)
+
+        # --- Comparison / General summaries ---
+        if assistant_run.get("comparison_summary"):
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = f"Turn {idx}: Comparison Summary"
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
+            tf = box.text_frame
+            tf.word_wrap = True
+            for para in str(assistant_run.get("comparison_summary")).split("\n"):
                 if para.strip():
                     p = tf.add_paragraph()
                     p.text = para.strip()
                     p.font.size = Pt(12)
-                    p.space_after = Pt(3)
 
-        # 🖼️ Image Slide (only from the most similar document)
-        faiss_images = entry.get("faiss_images", [])
-        faiss_sources = entry.get("faiss_sources", [])
+        if assistant_run.get("general_summary"):
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = f"Turn {idx}: General Summary"
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
+            tf = box.text_frame
+            tf.word_wrap = True
+            for para in str(assistant_run.get("general_summary")).split("\n"):
+                if para.strip():
+                    p = tf.add_paragraph()
+                    p.text = para.strip()
+                    p.font.size = Pt(12)
+
+        # --- Web links (search/comp) ---
+        web_links = assistant_run.get("web_links") or assistant_run.get("result") if route == "search" else assistant_run.get("web_links")
+        if web_links:
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = f"Turn {idx}: Top Web Links"
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
+            tf = box.text_frame
+            tf.word_wrap = True
+            for i, item in enumerate(web_links, 1):
+                # item could be tuple (markdown_link, summary) or simple string
+                link_md, summary = (item[0], item[1]) if (isinstance(item, (list, tuple)) and len(item) >= 2) else (str(item), "")
+                match = re.match(r"\[(.*?)\]\((.*?)\)", str(link_md))
+                if match:
+                    title, url = match.groups()
+                else:
+                    title, url = f"Link {i}", str(link_md)
+
+                p = tf.add_paragraph()
+                run = p.add_run()
+                run.text = f"{i}. {title}"
+                try:
+                    run.font.size = Pt(12)
+                    run.hyperlink.address = url
+                except Exception:
+                    pass
+                if summary:
+                    s_p = tf.add_paragraph()
+                    s_p.text = f"    ↳ {str(summary)[:300]}"
+                    s_p.font.size = Pt(11)
+
+        # --- FAISS route slides if present (assistant_run or entry-level) ---
+        faiss_summary = assistant_run.get("faiss_summary")
+        faiss_sources = assistant_run.get("faiss_sources") or assistant_run.get("faiss_sources", [])
+        faiss_images = assistant_run.get("faiss_images") or assistant_run.get("faiss_images", [])
+
+        if faiss_summary:
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = f"Turn {idx}: FAISS Summary"
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
+            tf = box.text_frame
+            tf.word_wrap = True
+            for para in str(faiss_summary).split("\n"):
+                if para.strip():
+                    p = tf.add_paragraph()
+                    p.text = para.strip()
+                    p.font.size = Pt(12)
+
+        if faiss_sources:
+            for i, src in enumerate(faiss_sources, 1):
+                try:
+                    docname, snippet, path = src[0], src[1], src[2] if len(src) >= 3 else (src[0], src[1], None)
+                except Exception:
+                    docname, snippet, path = str(src), "", None
+                slide = prs.slides.add_slide(layout)
+                slide.shapes.title.text = f"Turn {idx}: FAISS Source {i} - {os.path.basename(path) if path else docname}"
+                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
+                tf = box.text_frame
+                tf.word_wrap = True
+                for para in str(snippet).split("\n"):
+                    if para.strip():
+                        p = tf.add_paragraph()
+                        p.text = para.strip()
+                        p.font.size = Pt(11)
+
         if faiss_images and faiss_sources:
-            top_docname = faiss_sources[0][0]  # first doc's name
-            top_doc_images = [img for img in faiss_images if img.get("original_doc") == top_docname]
-
-            if top_doc_images:
-                slide = prs.slides.add_slide(prs.slide_layouts[5])  # blank layout
-                slide.shapes.title.text = f"Images from {top_docname}"
-
-                # Adjust layout
+            # Only include images from the most-similar doc (first in faiss_sources)
+            top_docname = faiss_sources[0][0] if isinstance(faiss_sources[0], (list, tuple)) else faiss_sources[0]
+            top_images = [img for img in faiss_images if img.get("original_doc") == top_docname]
+            if top_images:
+                slide = prs.slides.add_slide(prs.slide_layouts[5])
+                slide.shapes.title.text = f"Turn {idx}: Images from {top_docname}"
                 left = Inches(0.8)
-                top = Inches(2.5)  # ⬅️ Increased top margin
-                image_width = Inches(6)  # ⬅️ Increased width
-                spacing = Inches(0.6)
-
-                for idx, img_meta in enumerate(top_doc_images):
-                    img_path = img_meta.get("extracted_image_path")
+                top = Inches(2.2)
+                image_width = Inches(5.5)
+                spacing = Inches(0.5)
+                for im_meta in top_images:
+                    img_path = im_meta.get("extracted_image_path")
                     if img_path and os.path.exists(img_path):
                         slide.shapes.add_picture(img_path, left, top, width=image_width)
-                        top += Inches(3.2)  # ⬅️ Increased vertical spacing
-
-                        if top > Inches(6.5):  # wrap to next column if needed
-                            top = Inches(2.0)
+                        top += Inches(3.2)
+                        if top > Inches(6.5):
+                            top = Inches(2.2)
                             left += image_width + spacing
 
+        # --- Charts: if there is chart_info (you can expand how to render charts later) ---
+        chart_info = assistant_run.get("chart_info")
+        if chart_info:
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = f"Turn {idx}: Chart Info"
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
+            tf = box.text_frame
+            tf.word_wrap = True
+            tf.paragraphs[0].text = str(chart_info)[:1500]
 
-    # Finalize PPT in memory
+    # End: return PPT as BytesIO
     ppt_bytes = BytesIO()
     prs.save(ppt_bytes)
     ppt_bytes.seek(0)
     return ppt_bytes
 
+
+def _get_entry_datetime(entry):
+    """
+    Return a datetime for a history `entry`:
+    - checks keys in order: 'timestamp', 'created_at', 'archived_at'
+    - if not found, tries first/last message timestamps in entry['messages']
+    - if still not found, returns current datetime
+    Accepts string timestamps in format "%d %b %Y, %I:%M %p" or ISO format.
+    """
+    # 1) top-level fields
+    ts = entry.get("timestamp") or entry.get("created_at") or entry.get("archived_at")
+    # 2) try messages list
+    if not ts:
+        msgs = entry.get("messages") or []
+        if msgs:
+            # prefer first message timestamp then last
+            ts = msgs[0].get("timestamp") or msgs[-1].get("timestamp") or msgs[0].get("assistant_run", {}).get("timestamp")
+    # 3) fallback to now
+    if not ts:
+        return datetime.now()
+
+    # 4) parse
+    if isinstance(ts, datetime):
+        return ts
+    if isinstance(ts, (int, float)):
+        try:
+            return datetime.fromtimestamp(ts)
+        except Exception:
+            return datetime.now()
+
+    ts_str = str(ts)
+    # try your expected format first
+    try:
+        return datetime.strptime(ts_str, "%d %b %Y, %I:%M %p")
+    except Exception:
+        pass
+    # try ISO formats
+    try:
+        return datetime.fromisoformat(ts_str)
+    except Exception:
+        pass
+    # try common alternative formats (best-effort)
+    alt_formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+    ]
+    for fmt in alt_formats:
+        try:
+            return datetime.strptime(ts_str, fmt)
+        except Exception:
+            continue
+    # give up -> return now
+    return datetime.now()
+
+
+def _format_dataframe_for_display(result_obj):
+    """Helper: convert serialized list/dict to DataFrame and format numeric columns."""
+    df = result_obj
+    if isinstance(result_obj, list):
+        df = pd.DataFrame(result_obj)
+    if isinstance(df, pd.DataFrame):
+        formatted_df = df.copy()
+        for col in formatted_df.select_dtypes(include='number').columns:
+            col_lower = col.lower()
+            if "ratio" in col_lower:
+                formatted_df[col] = formatted_df[col].apply(lambda x: f"{x * 100:.2f}%" if pd.notnull(x) else "")
+            elif any(keyword in col_lower for keyword in money_keywords):
+                formatted_df[col] = formatted_df[col].apply(lambda x: f"{x:,.0f}" if pd.notnull(x) else "")
+        return formatted_df
+    return result_obj
+
+def _render_document_block(run):
+    """Render document-related parts for a run_record (document route)."""
+    header = run.get("header_updated") or run.get("header_candidate")
+    table_idx = run.get("table_index_updated") or run.get("table_candidate_index")
+    if header:
+        st.markdown(f"**Header:** {header}")
+    if table_idx is not None:
+        st.markdown(f"**Table index:** {table_idx}")
+
+    # preview (before update)
+    preview_rows = run.get("preview_df")
+    preview_cols = run.get("preview_df_columns")
+    if preview_rows:
+        st.markdown("**Matched Table (preview)**")
+        try:
+            preview_df = pd.DataFrame(preview_rows, columns=preview_cols if preview_cols else None)
+        except Exception:
+            preview_df = pd.DataFrame(preview_rows)
+        st.dataframe(preview_df)
+
+    # Download button - use stored unique key
+    updated_path = run.get("updated_doc_path")
+    download_key = run.get("updated_doc_key") or f"history_download_{hash(str(updated_path))}"
+    if updated_path and os.path.exists(updated_path):
+        with open(updated_path, "rb") as f:
+            st.download_button(
+                "📥 Download Updated Document",
+                f,
+                file_name=os.path.basename(updated_path) or "updated.docx",
+                key=download_key
+            )
+    else:
+        st.warning("Updated document file not available (may be temporary).")
+
+def _render_faiss_block(entry):
+    """Render faiss route elements from the archived entry (keeps original logic)."""
+    st.subheader("📘 Internal Knowledge Base Answer:")
+    st.markdown(entry.get("faiss_summary", "_No summary available._"))
+
+    faiss_images = entry.get("faiss_images", [])
+    faiss_sources = entry.get("faiss_sources", [])
+    if faiss_images and faiss_sources:
+        top_doc = faiss_sources[0][0]
+        st.subheader(f"🖼️ Images from: {top_doc}")
+        for meta in faiss_images:
+            if meta.get("original_doc") == top_doc:
+                img_path = meta.get("extracted_image_path")
+                if img_path and os.path.exists(img_path):
+                    st.image(img_path, caption=meta.get("caption", ""), use_container_width=True)
+
+    st.subheader("📄 Document Sources:")
+    base_dir = os.path.dirname(__file__)
+    for i, (docname, snippet, path) in enumerate(faiss_sources, 1):
+        col1, col2 = st.columns([0.85, 0.15])
+        with col1:
+            st.markdown(f"**{i}. {docname}**\n\n{snippet}")
+        with col2:
+            if path:
+                full_path = os.path.join(base_dir, path).replace("\\", "/")
+                if os.path.exists(full_path):
+                    with open(full_path, "rb") as f:
+                        st.download_button(
+                            label="⬇️",
+                            data=f,
+                            file_name=os.path.basename(path),
+                            key=f"download_history_{i}"
+                        )
+
+def _render_run_by_route(run):
+    """Render the assistant_run (the full per-turn run_record) according to its route.
+       This mirrors the previous single-entry rendering but scoped to a run record."""
+    route = run.get("route")
+    # For SQL-like or document-like routes, we show sql and result
+    if route in ["sql", "document", "comp"]:
+        # Document-specific extra (only for 'document' route)
+        if route == "document":
+            st.subheader("📄 Document Update (turn)")
+            _render_document_block(run)
+
+        # SQL Query Result
+        if run.get("sql_query"):
+            st.subheader("🧾 SQL Query:")
+            st.code(run["sql_query"], language="sql")
+
+        st.subheader("SQL Query Result:")
+        result_df = run.get("result")
+        formatted = _format_dataframe_for_display(result_df)
+        if isinstance(formatted, pd.DataFrame):
+            st.dataframe(formatted)
+        else:
+            st.text(formatted if formatted is not None else "_No result returned_")
+
+        # For comparison runs, show summaries and web links if present
+        if route == "comp":
+            if run.get("general_summary"):
+                st.subheader("🧠 General Summary:")
+                st.markdown(run["general_summary"])
+            st.subheader("🔗 Top Web Links:")
+            for i, (link, summary) in enumerate(run.get("web_links") or [], 1):
+                st.markdown(f"**{i}.** {link}")
+                st.markdown(f"_Summary:_\n{summary}")
+            if run.get("comparison_summary"):
+                st.subheader("🆚 Comparison Summary:")
+                st.markdown(run["comparison_summary"])
+
+    elif route == "faissdb":
+        # faissdb runs may be stored within a run or (for older entries) at the top-level entry.
+        _render_faiss_block(run)
+
+    elif route == "search":
+        if run.get("general_summary"):
+            st.subheader("🧠 General Summary:")
+            st.markdown(run["general_summary"])
+        st.subheader("🔗 Top Web Links:")
+        for i, (link, summary) in enumerate(run.get("result") or [], 1):
+            st.markdown(f"**{i}.** {link}")
+            st.markdown(f"_Summary:_\n{summary}")
+
+    else:
+        # Fallback: print any summary or raw result
+        if run.get("general_summary"):
+            st.subheader("🧠 General Summary:")
+            st.markdown(run["general_summary"])
+        if run.get("result"):
+            st.subheader("Result:")
+            formatted = _format_dataframe_for_display(run.get("result"))
+            if isinstance(formatted, pd.DataFrame):
+                st.dataframe(formatted)
+            else:
+                st.text(formatted)
 
 
 # ---- LangGraph Setup ----
@@ -1050,7 +2051,7 @@ graph_builder.add_edge("faissdb", END)
 agent_graph = graph_builder.compile()
 
 # ---- Streamlit UI ----
-st.title("\U0001F9E0 Project ASTRA")
+st.title("\U0001F9E0 Agentic AI Assistant (Insurance)")
 
 
 def format_date_label(chat_date: date) -> str:
@@ -1076,6 +2077,15 @@ if "chat_history" not in st.session_state:
 if "active_chat_index" not in st.session_state:
     st.session_state.active_chat_index = None
 
+# NEW: the live session (holds a list of Q/A messages)
+if "current_session" not in st.session_state:
+    st.session_state.current_session = {
+        "id": str(uuid.uuid4()),
+        "title": None,
+        "created_at": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        "messages": []  # each message: {"role":"user"/"assistant","text":..., "route":..., "result": ...}
+    }
+
 # ✅ Sidebar: Clear + View + Export
 with st.sidebar:
     st.header("🗂️ Session")
@@ -1087,7 +2097,8 @@ with st.sidebar:
 # ✅ Group and render chat history in sidebar
 grouped = {}
 for chat in st.session_state.chat_history:
-    chat_date = datetime.strptime(chat["timestamp"], "%d %b %Y, %I:%M %p").date()
+    chat_dt = _get_entry_datetime(chat)
+    chat_date = chat_dt.date()
     grouped.setdefault(chat_date, []).append(chat)
 
 for group_date in sorted(grouped.keys(), reverse=True):
@@ -1103,14 +2114,100 @@ for group_date in sorted(grouped.keys(), reverse=True):
                 st.session_state.just_ran_agent = False
 
 # ✅ Export chat history
+
+def safe_serialize_obj(obj):
+    """
+    Convert obj to a JSON-serializable representation.
+    Handles: pandas.DataFrame, list[dict], numpy types, datetime/date, Path, BytesIO.
+    For unknown objects, falls back to str(obj).
+    """
+    # None / primitives
+    if obj is None or isinstance(obj, (str, bool, int, float)):
+        return obj
+
+    # datetime / date
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    # Path
+    if isinstance(obj, Path):
+        return str(obj)
+
+    # BytesIO -> base64 (optional; careful about size)
+    if isinstance(obj, BytesIO):
+        # convert to base64 string (avoid if large)
+        obj.seek(0)
+        b64 = base64.b64encode(obj.read()).decode("ascii")
+        return {"__bytes_base64__": b64}
+
+    # pandas DataFrame
+    if isinstance(obj, pd.DataFrame):
+        try:
+            # prefer records orient (list of dicts)
+            return obj.where(pd.notnull(obj), None).to_dict(orient="records")
+        except Exception:
+            # fallback to string
+            return str(obj)
+
+    # pandas Series
+    if isinstance(obj, pd.Series):
+        try:
+            return obj.where(pd.notnull(obj), None).to_dict()
+        except Exception:
+            return list(obj)
+
+    # numpy scalar types
+    if isinstance(obj, (np.generic,)):
+        return obj.item()
+
+    # lists / tuples / sets
+    if isinstance(obj, (list, tuple, set)):
+        return [safe_serialize_obj(i) for i in obj]
+
+    # dicts -> apply recursively
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            # ensure keys are strings
+            key = str(k)
+            out[key] = safe_serialize_obj(v)
+        return out
+
+    # dataclasses? try to convert to dict
+    # fallback: try to use __dict__ if present
+    if hasattr(obj, "__dict__"):
+        try:
+            return safe_serialize_obj(vars(obj))
+        except Exception:
+            pass
+
+    # last resort: stringify
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+
 def serialize_chat_history(history):
+    """
+    Given st.session_state.chat_history (list of dicts), produce a JSON string safely.
+    Use this instead of plain json.dumps(history).
+    """
     safe_history = []
-    for chat in history:
-        safe_chat = chat.copy()
-        if isinstance(safe_chat.get("result"), pd.DataFrame):
-            safe_chat["result"] = safe_chat["result"].to_dict(orient="records")
-        safe_history.append(safe_chat)
-    return json.dumps(safe_history, indent=2)
+    for entry in history:
+        safe_entry = {}
+        # iterate keys in original entry and serialize values
+        for k, v in entry.items():
+            safe_entry[str(k)] = safe_serialize_obj(v)
+        # ensure messages list (if present) is serialized as well
+        if "messages" in safe_entry and isinstance(safe_entry["messages"], list):
+            safe_messages = []
+            for m in safe_entry["messages"]:
+                safe_messages.append(safe_serialize_obj(m))
+            safe_entry["messages"] = safe_messages
+        safe_history.append(safe_entry)
+
+    return json.dumps(safe_history, indent=2, ensure_ascii=False)
 
 history_json = serialize_chat_history(st.session_state.chat_history)
 
@@ -1126,6 +2223,70 @@ if "just_ran_agent" not in st.session_state:
 
 # ✅ UI Control Logic: if user is NOT viewing past chat
 if st.session_state.active_chat_index is None:
+
+
+    # near the main input area (when active_chat_index is None i.e. live session)
+    if st.button("Start New Session"):
+        sess = st.session_state.current_session
+        if not sess["messages"]:
+            # nothing to archive
+            st.warning("Current session is empty — nothing to archive.")
+        else:
+            last_run = sess["messages"][-1]["assistant_run"]
+
+            entry = {
+                "id": sess["id"],
+                "title": sess.get("title") or generate_title(sess["messages"][0]["user_prompt"]),
+                "prompt": sess["messages"][0]["user_prompt"],   # first prompt in session
+                "route": last_run.get("route"),
+                "result": last_run.get("result"),
+                "sql_query": last_run.get("sql_query"),
+
+                # Document fields (from last run)
+                "preview_df": last_run.get("preview_df"),
+                "preview_df_columns": last_run.get("preview_df_columns"),
+                "header_candidate": last_run.get("header_candidate"),
+                "table_candidate_index": last_run.get("table_candidate_index"),
+                "header_updated": last_run.get("header_updated"),
+                "table_index_updated": last_run.get("table_index_updated"),
+                "updated_doc_path": last_run.get("updated_doc_path"),
+                "updated_doc_key": last_run.get("updated_doc_key"),
+
+                # Web and summaries
+                "web_links": last_run.get("web_links"),
+                "general_summary": last_run.get("general_summary"),
+                "comparison_summary": last_run.get("comparison_summary"),
+                "chart_info": last_run.get("chart_info"),
+
+                # FAISS stuff
+                "faiss_summary": last_run.get("faiss_summary"),
+                "faiss_sources": last_run.get("faiss_sources"),
+                "faiss_images": last_run.get("faiss_images"),
+
+                # keep the whole message list (full session)
+                "messages": sess["messages"],
+
+                # meta
+                "created_at": sess.get("created_at"),
+                "archived_at": datetime.now().strftime("%d %b %Y, %I:%M %p")
+            }
+
+            st.session_state.chat_history.append(entry)
+
+            # Reset current_session to a fresh empty session
+            st.session_state.current_session = {
+                "id": str(uuid.uuid4()),
+                "title": None,
+                "created_at": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+                "messages": []
+            }
+
+            # Reset conversation context as well (since it's per-session)
+            st.session_state.conversation = []
+            st.session_state.active_chat_index = len(st.session_state.chat_history) - 1
+            st.rerun()
+
+
     with st.form(key="query_form"):
         user_prompt = st.text_input("Enter your query:")
         doc_file = st.file_uploader("Upload Insurance Document (.docx)", type=["docx"])
@@ -1149,22 +2310,48 @@ if st.session_state.active_chat_index is None:
         else:
             doc_path = None
 
+
         state: GraphState = {
+            # Core inputs
             "user_prompt": user_prompt,
             "doc_loaded": doc_path is not None,
             "document_path": doc_path,
+
+            # Prompts
             "vanna_prompt": None,
             "fuzzy_prompt": None,
+
+            # Routing
             "route": None,
+
+            # SQL-related
             "sql_result": None,
             "sql_query": None,
-            "web_links": None,
+
+            # Document-related
             "updated_doc_path": None,
+            "header_candidate": None,
+            "table_candidate_index": None,
+            "header_updated": None,
+            "table_index_updated": None,
+            "updated_doc_key": None,
+            "preview_df": None,
+            "preview_df_columns": None,
+
+            #"candidate_tables": None,
+
+            # External search
+            "web_links": None,
+
+            # Visualization / summaries
             "comparison_summary": None,
             "general_summary": None,
+            "chart_info": None,
+
+            # FAISS Knowledge base
             "faiss_summary": None,
             "faiss_sources": None,
-            "faiss_images": None
+            "faiss_images": None,
         }
 
         with st.spinner("Running Agent..."):
@@ -1180,138 +2367,232 @@ if st.session_state.active_chat_index is None:
                 st.code(traceback.format_exc())
                 st.stop()
 
-        # ✅ Save to chat history
-        chat_entry = {
+
+        # Build a full "run_record" that mirrors your old entry exactly.
+        # Note: keep this small enough to be serializable. Convert any DataFrames to list-of-dicts,
+        # and for large files use file paths/keys rather than embedding binary content.
+        def safe_serialize_preview_df(df_like):
+            # If it's already a list-of-dicts, return as-is.
+            # If it's a pandas DataFrame, convert to records.
+            try:
+                import pandas as pd
+                if isinstance(df_like, pd.DataFrame):
+                    return df_like.to_dict(orient="records")
+            except Exception:
+                pass
+            return df_like
+
+        run_record = {
+            "id": str(uuid.uuid4()),
             "prompt": user_prompt,
             "title": generate_title(user_prompt),
             "route": output.get("route"),
+
+            # Results
             "result": output.get("sql_result") if output.get("route") in ["sql", "document", "comp"] else output.get("web_links"),
             "sql_query": output.get("sql_query"),
+
+            # Document-related fields
+            "preview_df": safe_serialize_preview_df(output.get("preview_df")),
+            "preview_df_columns": output.get("preview_df_columns"),
+            "header_candidate": output.get("header_candidate"),
+            "table_candidate_index": output.get("table_candidate_index"),
+            "header_updated": output.get("header_updated"),
+            "table_index_updated": output.get("table_index_updated"),
+            "updated_doc_path": output.get("updated_doc_path"),
+            "updated_doc_key": output.get("updated_doc_key"),
+            #"candidate_tables": output.get("candidate_tables"),
+
+            # External search
             "web_links": output.get("web_links"),
+
+            # Summaries / visualization
             "general_summary": output.get("general_summary"),
             "comparison_summary": output.get("comparison_summary"),
-            "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+            "chart_info": output.get("chart_info"),
+
+            # FAISS Knowledge base
             "faiss_summary": output.get("faiss_summary"),
             "faiss_sources": output.get("faiss_sources"),
-            "faiss_images": output.get("faiss_images")
+            "faiss_images": output.get("faiss_images"),
+
+            # any additional custom fields the nodes may emit
+            "extra": output.get("extra", {}),
+
+            # Meta
+            "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p")
         }
 
-        st.session_state.chat_history.append(chat_entry)
-        st.session_state.active_chat_index = len(st.session_state.chat_history) - 1
+        # Append the run_record to the live session's messages
+        # We'll store both the user input and the assistant/run result as a single message item
+        st.session_state.current_session["messages"].append({
+            "role": "turn",                # 'turn' groups the user->assistant result; you can also use separate user/assistant items
+            "user_prompt": user_prompt,
+            "assistant_run": run_record,
+            "timestamp": run_record["timestamp"]
+        })
+
+        # Mark that agent ran (for UI)
         st.session_state.just_ran_agent = True
 
-        col_left, col_mid, col_right = st.columns([4, 0.4 ,1.5])
+
+        #Render workflow + live session (reverse-chronological, assistant-first) ----------
+        col_left, col_mid, col_right = st.columns([4, 0.4, 1.5])
 
         with col_right:
             if st.session_state.get("output"):
                 st.markdown("### 🧭 Workflow Diagram")
                 visualize_workflow(graph_builder, active_route=st.session_state["output"].get("route"))
 
-
         with col_left:
-            # ✅ Output rendering
-            if output.get("route") in ["sql", "document", "comp"] and output.get("sql_result") is not None:
-                st.subheader("SQL Query Result:")
-                if output.get("sql_query"):  # For live session
-                    st.code(output["sql_query"], language="sql")
-                try:
-                    sql_df = output["sql_result"]
-                    if isinstance(sql_df, pd.DataFrame):
-                        formatted_df = sql_df.copy()
-                        for col in formatted_df.select_dtypes(include='number').columns:
-                            col_lower = col.lower()
-                            if "ratio" in col_lower:
-                                formatted_df[col] = formatted_df[col].apply(lambda x: f"{x * 100:.2f}%" if pd.notnull(x) else "")
-                            elif any(keyword in col_lower for keyword in money_keywords):
-                                formatted_df[col] = formatted_df[col].apply(lambda x: f"{x:,.0f}")
+            # Render the entire current session in reverse-chronological order (latest first).
+            sess = st.session_state.get("current_session", {"messages": [], "created_at": ""})
+            messages = sess.get("messages", [])
 
-                        st.dataframe(formatted_df)
-                    else:
-                        st.write("Raw SQL output:")
-                        st.write(sql_df)
-                except Exception as e:
-                    st.warning(f"Could not display table properly: {e}")
-                    st.write(output["sql_result"])
+            st.markdown("### 💬 Current Session (Live) — Latest first")
+            sess_title = sess.get("title") or (messages[0].get("user_prompt") if messages else "New Session")
+            st.caption(f"Session: {sess_title} — Created: {sess.get('created_at', '')}")
 
-                if any(word in output["user_prompt"].lower() for word in ["plot", "draw", "visualize", "chart", "bar graph", "line graph", "pie chart", "graph"]):
-                    user_chart_type = get_user_chart_type(output["user_prompt"])
-                    chart_info = suggest_chart(sql_df)
-                    
-                    if chart_info and user_chart_type:
-                        chart_info["type"] = user_chart_type
+            if not messages:
+                st.info("No messages yet. Ask your first question!")
+            else:
+                # Show latest turn first (assistant output first, then user prompt)
+                rev_messages = list(reversed(messages))
 
-                    if chart_info:
+                for display_idx, turn in enumerate(rev_messages, start=1):
+                    assistant_run = turn.get("assistant_run")
+                    assistant_text = None
+                    if not assistant_run:
+                        assistant_text = turn.get("assistant_text") or turn.get("result") or turn.get("answer")
+
+                    user_prompt_cap = (turn.get("user_prompt") or "").strip()
+                    # Assistant output first (most recent on top)
+                    st.markdown(f"#### {display_idx}. User Prompt: {user_prompt_cap}")
+                    if assistant_run:
+                        # Preferred: reuse your robust renderer
                         try:
-                            plot_chart(sql_df, chart_info)
+                            _render_run_by_route(assistant_run)
+
+                            # get the user prompt for this turn
+                            user_prompt = (turn.get("user_prompt") or "").strip()
+                            # Only proceed if user prompt mentions plotting intent
+                            plotting_keywords = ["plot", "draw", "visualize", "chart", "bar graph", "line graph", "pie chart", "graph"]
+                            if user_prompt and any(word in user_prompt.lower() for word in plotting_keywords):
+                                # Reconstruct a DataFrame from assistant_run result if possible
+                                sql_df = None
+                                res = assistant_run.get("result") if assistant_run else None
+
+                                # result may be list-of-dicts or a DataFrame
+                                if isinstance(res, list):
+                                    try:
+                                        sql_df = pd.DataFrame(res)
+                                    except Exception:
+                                        sql_df = None
+                                elif isinstance(res, pd.DataFrame):
+                                    sql_df = res
+                                else:
+                                    # sometimes result stored as stringified table or under a different key
+                                    # try assistant_run.get("preview_df") as fallback (document route)
+                                    preview = assistant_run.get("preview_df") if assistant_run else None
+                                    if isinstance(preview, list):
+                                        try:
+                                            sql_df = pd.DataFrame(preview)
+                                        except Exception:
+                                            sql_df = None
+
+                                # Only try to suggest/plot if we have a reasonable DataFrame
+                                if sql_df is not None and not sql_df.empty:
+                                    user_chart_type = None
+                                    try:
+                                        user_chart_type = get_user_chart_type(user_prompt)
+                                    except Exception:
+                                        # failing to parse user chart type shouldn't block plotting
+                                        user_chart_type = None
+
+                                    chart_info = None
+                                    try:
+                                        chart_info = suggest_chart(sql_df)
+                                    except Exception as e:
+                                        chart_info = None
+                                        # optionally show debug: st.info(f"chart suggestion error: {e}")
+
+                                    if chart_info and user_chart_type:
+                                        chart_info["type"] = user_chart_type
+
+                                    if chart_info:
+                                        try:
+                                            plot_chart(sql_df, chart_info)
+                                        except Exception as e:
+                                            st.warning(f"Could not render chart: {e}")
+                                else:
+                                    # no tabular data to chart
+                                    st.info("No tabular result available in this turn to create a chart from.")
+
                         except Exception as e:
-                            st.warning(f"Could not render chart: {e}")
+                            # fallback rendering if helper missing or errors out
+                            st.warning(f"(Renderer error: {e}) Showing raw assistant summary/result instead.")
+                            if assistant_run.get("general_summary"):
+                                st.markdown(assistant_run.get("general_summary"))
+                            elif assistant_run.get("result"):
+                                st.write(assistant_run.get("result"))
+                            elif assistant_run.get("web_links"):
+                                for i, item in enumerate(assistant_run.get("web_links"), 1):
+                                    st.markdown(f"{i}. {item}")
+                    else:
+                        if assistant_text:
+                            st.markdown(assistant_text)
+                        else:
+                            st.text("_No assistant output available for this turn_")
 
-            if output.get("route") in ["search", "comp"] and output.get("web_links"):
-                st.subheader("🧠 General Summary:")
-                summary = output.get("general_summary")
-                if summary and summary.strip().lower() != "none":
-                    st.markdown(summary)
-                else:
-                    st.markdown("_No summary could be generated from the results._")
+                    # Then show corresponding user prompt below the assistant output
+                    user_prompt = turn.get("user_prompt") or turn.get("text") or turn.get("prompt") or ""
+                    if user_prompt:
+                        st.markdown(f"**You:** {user_prompt}")
 
-                st.subheader("🔗 Top Web Links:")
-                for i, (link, summary) in enumerate(output["web_links"], 1):
-                    st.markdown(f"**{i}.** {link}")
-                    st.markdown(f"_Summary:_\n{summary}")
+                    # Timestamp (if present)
+                    ts = turn.get("timestamp") or (assistant_run.get("timestamp") if assistant_run else None)
+                    if ts:
+                        st.caption(f"🕒 {ts}")
 
-            if output.get("route") == "comp" and output.get("comparison_summary"):
-                st.subheader("🆚 Comparison Summary:")
-                st.markdown(output["comparison_summary"])
-            
-            if output.get("route") == "faissdb":
-                st.subheader("📘 Internal Knowledge Base Answer:")
-                st.markdown(output.get("faiss_summary", "_No summary available._"))
+                    st.markdown("---")
 
-                # Show images related to the most similar doc
-                if output.get("faiss_images"):
-                    most_similar_doc = output["faiss_sources"][0][0]  # get docname
-                    st.subheader(f"🖼️ Images from: {most_similar_doc}")
-                    for meta in output["faiss_images"]:
-                        if meta["original_doc"] == most_similar_doc:
-                            img_path = meta["extracted_image_path"]
-                            if img_path and os.path.exists(img_path):
-                                st.image(img_path, caption=meta.get("caption", ""), use_container_width=True)
-
-                st.subheader("📄 Document Sources:")
-                base_dir = os.path.dirname(__file__)
-                for i, (docname, snippet, path) in enumerate(output.get("faiss_sources", []), 1):
-                    st.markdown(f"**{i}. {docname}**\n\n{snippet}")
-                    #st.code(f"📁 File path: {path}")
-                    #st.code(f"🧪 Exists: {os.path.exists(path) if path else 'No path'}")
-                    if path:
-                        full_path = os.path.join(base_dir, path).replace("\\", "/")
-                        if os.path.exists(full_path):
-                            with open(full_path, "rb") as f:
-                                st.download_button(
-                                    label=f"📥 Download {os.path.basename(path)}",
-                                    data=f,
-                                    file_name=os.path.basename(path),
-                                    key=f"download_doc_{i}"
-                                )
-
-
-
-
-            if output.get("updated_doc_path"):
-                with open(output["updated_doc_path"], "rb") as f:
-                    st.download_button("Download Updated Document", f, file_name="updated.docx")
-
+            # After rendering the live conversation, show followups and the single PPT export button
             if st.session_state.get("followups"):
                 st.markdown("### 💬 You could also ask:")
-                for q in followups:
+                for q in st.session_state.get("followups", []):
                     st.markdown(f"- 👉 {q}")
 
-            st.download_button("⬇️ Export to PPT", generate_ppt(chat_entry), file_name="agentic_ai_output.pptx")
+            try:
+                entry_for_export = {
+                    "id": sess.get("id"),
+                    "title": sess.get("title"),
+                    "prompt": sess.get("messages")[0]["user_prompt"] if sess.get("messages") else sess.get("title") or "",
+                    "messages": sess.get("messages", []),
+                    "created_at": sess.get("created_at"),
+                }
 
-            st.session_state.just_ran_agent = False
-            st.session_state.active_chat_index = None
+                # Generate PPT buffer and show download button directly (same as history)
+                ppt_buffer = generate_ppt(entry_for_export)
+                # ensure pointer at start
+                try:
+                    ppt_buffer.seek(0)
+                except Exception:
+                    pass
 
+                st.download_button(
+                    label="⬇️ Export current session to PPT",
+                    data=ppt_buffer,
+                    file_name="agentic_ai_session.pptx",
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    key=f"download_ppt_live_{entry_for_export.get('id')}"
+                )
 
+            except Exception as e:
+                st.warning(f"PPT export not available: {e}")
+
+        # Keep the app state similar to before: mark that we've finished rendering post-run
+        st.session_state.just_ran_agent = False
+        st.session_state.active_chat_index = None
 
 
 else:
@@ -1320,121 +2601,67 @@ else:
     if st.button("Start New Query"):
         st.session_state.active_chat_index = None
         st.session_state.user_prompt = ""
+
         st.rerun() 
 
-# ✅ Render selected chat in main area
+# ✅ History Rendering selected chat in main area
+# ---------------------------
+# Render selected chat in main area (full session support)
+# ---------------------------
+
+# ---------- Main rendering logic ----------
 if st.session_state.active_chat_index is not None and not st.session_state.just_ran_agent:
     entry = st.session_state.chat_history[st.session_state.active_chat_index]
-    st.markdown(f"### 📝 Prompt\n{entry['prompt']}")
-    st.caption(f"🕒 {entry['timestamp']}")
-    st.markdown(f"_Route_: `{entry['route']}`")
 
-    if entry["route"] in ["sql", "document"]:
-        st.subheader("SQL Query Result:")
-        if entry.get("sql_query"):  # For history view
-            st.code(entry["sql_query"], language="sql")
-        result_df = entry.get("result")
-        if isinstance(result_df, list):  # was serialized
-            result_df = pd.DataFrame(result_df)
-        if isinstance(result_df, pd.DataFrame):
-            formatted_df = result_df.copy()
-            for col in formatted_df.select_dtypes(include='number').columns:
-                col_lower = col.lower()
-                if "ratio" in col_lower:
-                    formatted_df[col] = formatted_df[col].apply(lambda x: f"{x * 100:.2f}%" if pd.notnull(x) else "")
-                elif any(keyword in col_lower for keyword in money_keywords):
-                    formatted_df[col] = formatted_df[col].apply(lambda x: f"{x:,.0f}")
-            st.dataframe(formatted_df)
-        else:
-            st.text(result_df)
+    # If the entry contains a 'messages' list (archived session), render each turn in order.
+    if entry.get("messages"):
+        # Session header: use title if present else first prompt
+        title = entry.get("title") or entry.get("prompt") or entry["messages"][0].get("user_prompt", "Session")
+        st.markdown(f"### 🗂️ Session: {title}")
+        # show created/archived metadata if present
+        created = entry.get("created_at") or entry.get("timestamp")
+        archived = entry.get("archived_at")
+        if created:
+            st.caption(f"Created: {created}")
+        if archived:
+            st.caption(f"Archived: {archived}")
 
-    elif entry["route"] == "faissdb":
-        st.subheader("📘 Internal Knowledge Base Answer:")
-        st.markdown(entry.get("faiss_summary", "_No summary available._"))
+        # Iterate through messages in stored order (do not change order)
+        for idx, turn in enumerate(entry["messages"], start=1):
+            # Support two stored formats:
+            # 1) new format: {"role":"turn","user_prompt":..., "assistant_run": run_record, "timestamp":...}
+            # 2) older format: {"role":"user","text": "..."} or similar
+            user_prompt = turn.get("user_prompt") or turn.get("text") or turn.get("prompt")
+            timestamp = turn.get("timestamp") or turn.get("assistant_run", {}).get("timestamp") or ""
+            st.markdown(f"**{idx}. You:** {user_prompt}")
+            if timestamp:
+                st.caption(f"🕒 {timestamp}")
 
-        # === Show Associated Images from Top Doc ===
-        faiss_images = entry.get("faiss_images", [])
-        faiss_sources = entry.get("faiss_sources", [])
-        if faiss_images and faiss_sources:
-            top_doc = faiss_sources[0][0]
-            st.subheader(f"🖼️ Images from: {top_doc}")
-            for meta in faiss_images:
-                if meta.get("original_doc") == top_doc:
-                    img_path = meta.get("extracted_image_path")
-                    if img_path and os.path.exists(img_path):
-                        st.image(img_path, caption=meta.get("caption", ""), use_container_width=True)
+            # Fetch assistant run record (if present)
+            assistant_run = turn.get("assistant_run")
+            if assistant_run:
+                # Render the assistant run preserving all fields and order
+                _render_run_by_route(assistant_run)
+            else:
+                # Fallback: maybe the message stored assistant text in `turn['assistant_text']` or similar
+                assistant_text = turn.get("assistant_text") or turn.get("answer") or turn.get("result")
+                if assistant_text:
+                    st.markdown(f"**Assistant:** {assistant_text}")
 
-        # === Show Document Sources with Download Buttons ===
-        st.subheader("📄 Document Sources:")
-        base_dir = os.path.dirname(__file__)
-        for i, (docname, snippet, path) in enumerate(faiss_sources, 1):
-            col1, col2 = st.columns([0.85, 0.15])
-            with col1:
-                st.markdown(f"**{i}. {docname}**\n\n{snippet}")
-            with col2:
-                if path:
-                    full_path = os.path.join(base_dir, path).replace("\\", "/")
-                    if os.path.exists(full_path):
-                        with open(path, "rb") as f:
-                            st.download_button(
-                                label="⬇️",
-                                data=f,
-                                file_name=os.path.basename(path),
-                                key=f"download_history_{i}"
-                            )
+            # Divider between turns
+            st.markdown("---")
 
-    elif entry["route"] == "search":
-        if entry.get("general_summary"):
-            st.subheader("🧠 General Summary:")
-            st.markdown(entry["general_summary"])
+        # After full session rendering, allow export to PPT (keeps previous behavior)
+        try:
+            ppt_buffer = generate_ppt(entry)
+            st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
+        except Exception:
+            # keep UI robust if PPT generator fails for some entries
+            st.warning("Unable to export PPT for this session.")
 
-        st.subheader("🔗 Top Web Links:")
-        for i, (link, summary) in enumerate(entry["result"], 1):
-            st.markdown(f"**{i}.** {link}")
-            st.markdown(f"_Summary:_\n{summary}")
+    else:
+        st.text("Message not found")
 
-    elif entry["route"] == "comp":
-        # ✅ Show SQL Query
-        if entry.get("sql_query"):
-            st.subheader("🧾 SQL Query:")
-            st.code(entry["sql_query"], language="sql")
-
-        # ✅ Show SQL Result
-        st.subheader("SQL Query Result:")
-        result_df = entry.get("result")
-        if isinstance(result_df, list):  # was serialized
-            result_df = pd.DataFrame(result_df)
-        if isinstance(result_df, pd.DataFrame):
-            formatted_df = result_df.copy()
-            for col in formatted_df.select_dtypes(include='number').columns:
-                col_lower = col.lower()
-                if "ratio" in col_lower:
-                    formatted_df[col] = formatted_df[col].apply(lambda x: f"{x * 100:.2f}%" if pd.notnull(x) else "")
-                elif any(keyword in col_lower for keyword in money_keywords):
-                    formatted_df[col] = formatted_df[col].apply(lambda x: f"{x:,.0f}")
-            st.dataframe(formatted_df)
-        else:
-            st.text(result_df)
-
-        # ✅ Comparison Summary
-        if entry.get("comparison_summary"):
-            st.subheader("🆚 Comparison Summary:")
-            st.markdown(entry["comparison_summary"])
-
-        # ✅ General Summary
-        if entry.get("general_summary"):
-            st.subheader("🧠 General Summary:")
-            st.markdown(entry["general_summary"])
-
-        # ✅ Web Links
-        st.subheader("🔗 Top Web Links:")
-        web_links = entry.get("web_links")
-        for i, (link, summary) in enumerate(web_links or [], 1):
-            st.markdown(f"**{i}.** {link}")
-            st.markdown(f"_Summary:_\n{summary}")
-
-    ppt_buffer = generate_ppt(entry)
-    st.download_button("⬇️ Export to PPT", ppt_buffer, file_name="agentic_ai_output.pptx")
 
 
 
