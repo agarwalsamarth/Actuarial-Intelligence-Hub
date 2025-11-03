@@ -660,7 +660,7 @@ def serp_node(state: GraphState) -> GraphState:
 def comp_node(state: GraphState) -> GraphState:
     # 1) INTERNAL: build a safe Vanna prompt (internal-only)
 
-    schema_desc = get_schema_description('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
+    schema_desc = get_schema_description('Actuarial_Data.db')
     raw_prompt = state.get("vanna_prompt") or state["user_prompt"]
 
     # Build a strict instruction block to prevent introspection
@@ -2661,6 +2661,7 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
+
 
 
 
