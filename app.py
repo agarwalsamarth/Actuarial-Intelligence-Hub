@@ -468,9 +468,20 @@ def plot_chart(df: pd.DataFrame, chart_info: dict):
 
 def vanna_node(state: GraphState) -> GraphState:
     # Use user_prompt if vanna_prompt is not available
-    prompt = state["vanna_prompt"]
+    schema_desc = get_schema_description('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
+    raw_prompt = state["user_prompt"]
 
-    sql_query = vn_model.generate_sql(prompt)
+    # Build a strict instruction block to prevent introspection
+    instruction_block = (
+        "IMPORTANT: You are only allowed to use the schema below — you must NOT inspect or read any rows from the database. "
+        "Do NOT request sample rows. Do NOT attempt to access the database for schema discovery. "
+        "Using only the schema below, produce a single valid SQL query (ANSI SQL or dialect I specify if needed) that returns "
+        "Return only the SQL; do not include explanation text."
+    )
+
+    combined_prompt = f"{schema_desc}\n\n{instruction_block}\n\nUser intent: {raw_prompt}\n\n"
+
+    sql_query = vn_model.generate_sql(combined_prompt)
 
     try:
         result = vn_model.run_sql(sql_query)
@@ -2661,6 +2672,7 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
+
 
 
 
