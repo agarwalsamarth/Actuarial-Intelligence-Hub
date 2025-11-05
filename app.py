@@ -3387,7 +3387,7 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
             # Support two stored formats:
             # 1) new format: {"role":"turn","user_prompt":..., "assistant_run": run_record, "timestamp":...}
             # 2) older format: {"role":"user","text": "..."} or similar
-            user_prompt = turn.get("user_prompt") or turn.get("text") or turn.get("prompt")
+            user_prompt = turn.get("user_prompt")
             timestamp = turn.get("timestamp") or turn.get("assistant_run", {}).get("timestamp") or ""
             st.markdown(f"**{idx}. You:** {user_prompt}")
             if timestamp:
@@ -3417,4 +3417,5 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
+
 
