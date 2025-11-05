@@ -1,5 +1,3 @@
-# Streamlit + LangGraph Agentic AI App
-
 import streamlit as st
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Optional, List
@@ -43,7 +41,9 @@ from io import BytesIO
 import base64
 from time import sleep
 from urllib.parse import urlparse
-
+import io
+import re
+from difflib import get_close_matches
 
 st.set_page_config(layout="wide")
 
@@ -59,17 +59,19 @@ faiss_index = FAISS.load_local("faiss_index", embedding, allow_dangerous_deseria
 money_keywords = ["loss", "premium", "amount", "cost", "ibnr", "ult", "total", "claim", "reserve", "payment"]
 
 # ---- Vanna Setup ----
-vanna_api_key = st.secrets["vanna_api_key"]
-vanna_model_name = st.secrets["vanna_model_name"]
+vanna_api_key = os.getenv("vanna_api_key")
+vanna_model_name = os.getenv("vanna_model_name")
 vn_model = VannaDefault(model=vanna_model_name, api_key=vanna_api_key)
 vn_model.connect_to_sqlite('Actuarial_Data.db')
 
 # ---- Config ----
-serpapi_key = st.secrets["SERPAPI_API_KEY"]
+#openai.api_key = os.getenv("TOGETHER_API_KEY")
+#openai.base_url = "https://api.together.xyz"
+serpapi_key = os.getenv("SERPAPI_API_KEY")
 
 # ---Open AI LLM---
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def call_llm(prompt: str) -> str:
     try:
@@ -131,6 +133,20 @@ class GraphState(TypedDict):
     faiss_sources: Optional[list[tuple[str, str]]]
     faiss_images: Optional[list[dict]]
 
+    # Reconciliation Agent
+    # Reconciliation / upload fields (add to GraphState)
+    uploaded_file1: Optional[object] = None       # the UploadedFile object (or None)
+    uploaded_file2: Optional[object] = None       # the UploadedFile object (or None)
+    uploaded_file1_path: Optional[str] = None     # temp file path on disk (or None)
+    uploaded_file2_path: Optional[str] = None     # temp file path on disk (or None)
+    uploaded_file1_is_excel: bool = False         # True if file1 appears excel/csv-like
+    uploaded_file2_is_excel: bool = False         # True if file2 appears excel/csv-like
+    reconcile_df: Optional[pd.DataFrame]
+    missing_in_A: Optional[pd.DataFrame]
+    missing_in_B: Optional[pd.DataFrame]
+    variance_summary: Optional[dict]
+    variance_commentary: Optional[str]
+
 
 def get_schema_description(db_path: str) -> str:
     conn = sqlite3.connect(db_path)
@@ -159,6 +175,7 @@ QSPairs = load_qs_pairs()
 qs_examples = "\n".join(
     f"Q: {pair['question']}\nSQL: {pair['sql']}" for pair in QSPairs[:7]  # Limit to 7 to avoid token overflow
 )
+
 
 documentation = """
 PnC_Data Table:
@@ -221,17 +238,46 @@ STATE_KEYS_SET_AT_ENTRY = [
 #     "faiss_summary", 
 #     "faiss_sources",
 #     "faiss_images"
+    ## Reconciliation / upload fields (add to GraphState)
+    # uploaded_file1: Optional[object] = None       # the UploadedFile object (or None)
+    # uploaded_file2: Optional[object] = None       # the UploadedFile object (or None)
+    # uploaded_file1_path: Optional[str] = None     # temp file path on disk (or None)
+    # uploaded_file2_path: Optional[str] = None     # temp file path on disk (or None)
+    # uploaded_file1_is_excel: bool = False         # True if file1 appears excel/csv-like
+    # uploaded_file2_is_excel: bool = False         # True if file2 appears excel/csv-like
+    # "reconcile_df",
+    # "missing_in_A",
+    # "missing_in_B",
+    # "variance_summary",
+    # "variance_commentary",
+    # "reconcile_source_files",
+
+
 ]
+
+# --- short-circuit: if both uploads exist and look like excel/csv, route deterministically to comp ---
+def _is_excel_like(uploaded_file):
+    try:
+        if not uploaded_file:
+            return False
+        name = getattr(uploaded_file, "name", "") or str(uploaded_file)
+        name = name.lower()
+        return name.endswith((".xls", ".xlsx", ".csv"))
+    except Exception:
+        return False
 
 
 def prune_state(state: GraphState, exclude: List[str]) -> dict:
     return {k: v for k, v in state.items() if k not in exclude}
 
-
 # ---- Router Node (with prompt generation) ----
 class RouterNode(Runnable):
     def invoke(self, state: GraphState, config=None) -> GraphState:
-        doc_flag = "yes" if state['doc_loaded'] else "no"
+        #doc_flag = "yes" if state['doc_loaded'] else "no"
+        doc_flag1 = "yes" if state.get(uploaded_file1_is_excel) else "no"
+        doc_flag2 = "yes" if state.get(uploaded_file2_is_excel) else "no"
+        doc1_exist = "yes" if state.get(file1_path) else "no"
+        doc2_exist = "yes" if state.get(file2_path) else "no"
         schema = get_schema_description('Actuarial_Data.db')
 
         router_prompt = f"""
@@ -259,9 +305,11 @@ class RouterNode(Runnable):
             -Your work is to remove the noise and focus only on things that are required to generate sql query from vanna. SO remove all the extra stuffs out of the user prompt.
 
 
-        3. "document" ONLY if a document is uploaded (Document Uploaded = yes) AND the question involves updating/reading a document.
+        3. "document" ONLY if one document is uploaded AND the question involves updating/reading a document.
         -If the route is "document", DO NOT include vanna_prompt or fuzzy_prompt.
-
+        -Check the status of the flag, only doc1_exist should be "yes" while doc2_exist should be "no". Status for
+            -Doc_flag1 = {doc1_exist}
+            -Doc_flag2 = {doc2_exist}
         
         4. Choose "search" if:
             - The user is asking about general or external information
@@ -270,7 +318,12 @@ class RouterNode(Runnable):
         - If the route is "search", DO NOT include vanna_prompt or fuzzy_prompt.
 
 
-        5.Choose "comp" when the user is comparing internal data against external data, competitors, or industry benchmarks.
+        5. Choose "comp" if both Doc_flag1 and Doc_flag2 are attached and both are excel files. Status for
+        -Doc_flag1 = {doc_flag1}
+        -Doc_flag2 = {doc_flag2}
+        - Return Vanna_prompt: same as user_prompt
+        
+        6.Choose "comp" when the user is comparing internal data against external data, competitors, or industry benchmarks.
             Examples include peer review, benchmarking, market positioning, or competitive ratios.
 
             Trigger words/phrases (especially relevant for Actuarial & Finance users):
@@ -302,7 +355,7 @@ class RouterNode(Runnable):
         -Only include relevant columns in vanna_prompt. Do not include ClaimNumber or ID columns unless the user specifically asks for them.
 
        
-        6. Choose "faissdb" when:
+        7. Choose "faissdb" when:
         - The prompt asks about the Sparta platform, Earmark Template, Branch Adjustment Template/Module, Projects in Sparta, or any internal process or documentation.
         - The user seems to be referring to internal workflows, or knowledge base content.
         -Example prompts that should be routed to `"faissdb"`:
@@ -344,35 +397,46 @@ class RouterNode(Runnable):
         }}
 
         User Prompt: "{state['user_prompt']}"
-        Document Uploaded: {doc_flag}
         """
+        #Document Uploaded: {doc_flag}
+        
+        if _is_excel_like(state.get("uploaded_file1")) and _is_excel_like(state.get("uploaded_file2")):
+            # Deterministic routing: both attachments present and are excel-like
+            parsed = {
+                "route": "comp",
+                "vanna_prompt": state.get("user_prompt"),
+                "fuzzy_prompt": None
+            }
+            chart_info = None
 
-        try:
-            response = call_llm(router_prompt)
-            #st.write("Route:", response)
+        else:
+            try:
+                response = call_llm(router_prompt)
+                #st.write("Route:", response)
 
-            match = re.search(r'{.*}', response, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group())
-                chart_info = parsed.get("chart_info")
-            else:
-                st.warning("LLM did not return valid JSON. Routing to 'search' as fallback.")
+                match = re.search(r'{.*}', response, re.DOTALL)
+                if match:
+                    parsed = json.loads(match.group())
+                    chart_info = parsed.get("chart_info")
+                else:
+                    st.warning("LLM did not return valid JSON. Routing to 'search' as fallback.")
+                    parsed = {"route": "search"}
+
+            except Exception as e:
+                st.error(f"[RouterNode] LLM call failed: {e}")
                 parsed = {"route": "search"}
 
-        except Exception as e:
-            st.error(f"[RouterNode] LLM call failed: {e}")
-            parsed = {"route": "search"}
+            # ✅ Enforce safety: remove vanna_prompt
+            if parsed.get("route") == "document":
+                parsed["fuzzy_prompt"] = state["user_prompt"]   # alias
+                parsed["vanna_prompt"] = None                   # will be set later
+            elif parsed.get("route") not in ["sql", "comp", "faissdb"]:
+                parsed["vanna_prompt"] = None
+                parsed["fuzzy_prompt"] = None
 
-        # ✅ Enforce safety: remove vanna_prompt
-        if parsed.get("route") == "document":
-            parsed["fuzzy_prompt"] = state["user_prompt"]   # alias
-            parsed["vanna_prompt"] = None                   # will be set later
-        elif parsed.get("route") not in ["sql", "comp", "faissdb"]:
-            parsed["vanna_prompt"] = None
-            parsed["fuzzy_prompt"] = None
-
-        # ✅ Define chart_info only if needed
-        chart_info = None
+            # Ensure chart_info is only kept for SQL route
+            if parsed.get("route") != "sql":
+                chart_info = None
         
         return {
             **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
@@ -385,7 +449,15 @@ class RouterNode(Runnable):
             "header_candidate": None,
             "table_candidate_index": None,
             "header_updated": None,
-            "table_index_updated": None
+            "table_index_updated": None,
+
+            #Reconciliation Agent
+            "reconcile_df": None,
+            "missing_in_A": None,
+            "missing_in_B": None,
+            "variance_summary": None,
+            "variance_commentary": None,
+            "reconcile_source_files": None,
         }
     
 # ---- Vanna SQL Node ----
@@ -468,6 +540,7 @@ def plot_chart(df: pd.DataFrame, chart_info: dict):
 
 def vanna_node(state: GraphState) -> GraphState:
     # Use user_prompt if vanna_prompt is not available
+
     schema_desc = get_schema_description('Actuarial_Data.db')
     raw_prompt = state["user_prompt"]
 
@@ -482,6 +555,9 @@ def vanna_node(state: GraphState) -> GraphState:
     combined_prompt = f"{schema_desc}\n\n{instruction_block}\n\nUser intent: {raw_prompt}\n\n"
 
     sql_query = vn_model.generate_sql(combined_prompt)
+    #prompt = state["vanna_prompt"]
+
+    #sql_query = vn_model.generate_sql(combined_prompt)
 
     try:
         result = vn_model.run_sql(sql_query)
@@ -667,89 +743,462 @@ def serp_node(state: GraphState) -> GraphState:
 #     "peer", "peers", "peer set", "vs", "versus", "against", "relative to",
 #     "compare", "comparison", "compared to", "market trend", "external"
 # ]
-
-def comp_node(state: GraphState) -> GraphState:
-    # 1) INTERNAL: build a safe Vanna prompt (internal-only)
-
-    schema_desc = get_schema_description('Actuarial_Data.db')
-    raw_prompt = state.get("vanna_prompt") or state["user_prompt"]
-
-    # Build a strict instruction block to prevent introspection
-    instruction_block = (
-        "IMPORTANT: You are only allowed to use the schema below — you must NOT inspect or read any rows from the database. "
-        "Do NOT request sample rows. Do NOT attempt to access the database for schema discovery. "
-        "Using only the schema below, produce a single valid SQL query (ANSI SQL or dialect I specify if needed) that returns "
-        "Return only the SQL; do not include explanation text."
-    )
-
-    combined_prompt = f"{schema_desc}\n\n{instruction_block}\n\nUser intent: {raw_prompt}\n\n"
-
-    sql_query = vn_model.generate_sql(combined_prompt)
-
-    try:
-        result = vn_model.run_sql(sql_query)
-        if isinstance(result, pd.DataFrame):
-            sql_df = result
-        elif isinstance(result, list):
-            sql_df = pd.DataFrame(result)
-        else:
-            sql_df = pd.DataFrame([{"Result": str(result)}])
-    except Exception as e:
-        sql_df = pd.DataFrame([{"Error": f"SQL Execution failed: {e}"}])
-
-    serp_result = serp_node({**state, "sql_query": sql_query, "sql_result": sql_df})
-
-    web_links = serp_result.get("web_links", [])
-    external_summary = serp_result.get("general_summary", "")
-
-    # 3) COMPARISON: clear separation + citations
-    comparison_prompt = f"""
-    You are an Benchmarking actuarial analyst. Compare OUR internal IBNR trend to EXTERNAL market/industry benchmarks.
-    Rules:
-    - Use INTERNAL SQL only for our numbers; do NOT infer market values from internal data.
-    - Use EXTERNAL WEB snippets only for market/industry values; if no numeric market average is found, say so explicitly.
-    - Put all money in **USD**, include **%/ratios/dates** where present.
-    - Append [i] citations for any external metric where i refers to the snippet index (shown below).
-    - If sources disagree, note the discrepancy briefly.
-
-    Your job is to:
-    1. Analyze differences, similarities, and gaps between internal company data and external web sources.
-    2. Focus heavily on **numerical metrics** such as:
-    - IBNR, Incurred Loss, Ultimate Loss
-    - Premiums, Loss Ratios
-    - Exposure Years, Percent changes
-
-    3. Focus more on:
-    - Trends (increases/decreases)
-    - Matching vs. diverging figures
-    - Numerical differences or % differences
-
-    Our internal (context only; do not reveal raw table):
-    SQL: {sql_query}
-    Top rows (context only):
-    {sql_df.head(5).to_markdown(index=False) if isinstance(sql_df, pd.DataFrame) else str(sql_df)}
-
-    External snippets (numbered):
-    {chr(10).join([f"[{i+1}] {s}" for i, (_, s) in enumerate(web_links)])}
-
-    Task:
-    1) 5–7 lines overview (internal vs market).
-    2) 3–5 bullets with side-by-side contrasts (Our vs Market) using USD/%/ratios and [citation] only for external numbers.
-    3) 1 “watch item” (e.g., social inflation, rate adequacy, reserving pressure) if relevant.
-
-    General external synthesis to leverage (do not copy verbatim; keep citations): 
-    {external_summary}
+def _read_table(path_or_uploaded):
     """
-    comparison_summary = call_llm(comparison_prompt).strip()
+    Robust reader for either:
+      - filesystem path (str) -> use pd.read_csv / pd.read_excel
+      - UploadedFile-like object (has .name and .read()) -> read bytes/text and parse
+    Returns a pandas.DataFrame or raises a helpful error.
+    """
+    # If we were passed a path string, read directly (preferred)
+    if isinstance(path_or_uploaded, str):
+        path = path_or_uploaded
+        if not os.path.exists(path):
+            raise ValueError(f"File path does not exist: {path}")
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        if ext == "csv":
+            # read CSV normally (allow inference), we'll normalize keys later
+            return pd.read_csv(path)
+        else:
+            # excel (xls/xlsx) or other spreadsheet formats
+            return pd.read_excel(path)
+
+    # If UploadedFile-like object or bytes-like
+    if hasattr(path_or_uploaded, "read"):
+        try:
+            # Reset pointer if possible (Streamlit UploadedFile might have been read earlier)
+            if hasattr(path_or_uploaded, "seek"):
+                try:
+                    path_or_uploaded.seek(0)
+                except Exception:
+                    pass
+
+            raw = path_or_uploaded.read()
+            if not raw:
+                # try resetting and reading again
+                if hasattr(path_or_uploaded, "seek"):
+                    try:
+                        path_or_uploaded.seek(0)
+                        raw = path_or_uploaded.read()
+                    except Exception:
+                        pass
+
+            # raw may be bytes or str
+            if isinstance(raw, bytes):
+                name = getattr(path_or_uploaded, "name", "") or ""
+                ext = name.lower().split(".")[-1] if "." in name else None
+                if ext == "csv":
+                    text = raw.decode("utf-8", errors="replace")
+                    return pd.read_csv(io.StringIO(text))
+                else:
+                    # try excel from bytes
+                    try:
+                        return pd.read_excel(io.BytesIO(raw))
+                    except ValueError:
+                        # fallback to openpyxl engine (xlsx)
+                        return pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+            else:
+                # raw is likely str (text), treat as CSV text
+                text = str(raw)
+                return pd.read_csv(io.StringIO(text))
+
+        except Exception as e:
+            raise ValueError(f"Failed to read uploaded file-like object: {e}")
+
+    # Otherwise unsupported type
+    raise ValueError(f"Unsupported file object: {type(path_or_uploaded)}")
+
+
+def is_year_like_series(s, min_year=1900, max_year=2100, max_unique_for_key=200):
+    """Return True if a pandas Series looks like a year/key column."""
+    vals = s.dropna().astype(str).str.strip()
+    if vals.empty:
+        return False
+
+    # If most values look like 4-digit integers within a year range -> year-like
+    digit_mask = vals.str.fullmatch(r"\d{4}")
+    if digit_mask.sum() / len(vals) > 0.8:
+        try:
+            ints = vals[digit_mask].astype(int)
+            if ints.between(min_year, max_year).all():
+                return True
+        except Exception:
+            pass
+
+    # Also treat small-cardinality numeric columns with values in year-range as year-like
+    try:
+        numeric_vals = pd.to_numeric(vals, errors="coerce").dropna()
+        if not numeric_vals.empty:
+            unique_count = numeric_vals.nunique()
+            if unique_count <= max_unique_for_key and numeric_vals.between(min_year, max_year).all():
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def detect_semantic_key_columns(df, extra_keywords=None):
+    """
+    Detect columns that should be treated as non-numeric keys even if numeric-looking.
+    Returns set of column names to force as non-numeric.
+    """
+    if extra_keywords is None:
+        extra_keywords = []
+
+    keywords = ["year", "exposure", "exp", "underwriting", "uw", "policyyear", "policy_year", "period"]
+    keywords = keywords + extra_keywords
+    keywords = [k.lower() for k in keywords]
+
+    forced_keys = set()
+    cols = list(df.columns)
+
+    # 1) name-based detection: regex 'year' or close match tokens
+    for col in cols:
+        col_low = str(col).lower()
+        if any(re.search(rf"\b{k}\b", col_low) for k in keywords):
+            forced_keys.add(col)
+            continue
+
+        tokens = re.split(r"[^a-z0-9]+", col_low)
+        for t in tokens:
+            if t and get_close_matches(t, keywords, n=1, cutoff=0.8):
+                forced_keys.add(col)
+                break
+
+    # 2) value-based detection (fallback): numeric columns that look like years
+    for col in cols:
+        if col in forced_keys:
+            continue
+        try:
+            if is_year_like_series(df[col]):
+                forced_keys.add(col)
+        except Exception:
+            continue
+
+    return forced_keys
+
+
+def normalize_key_column(df, col):
+    """Normalize a column intended for use as a join key (in-place)."""
+    if col not in df.columns:
+        return
+
+    s = df[col]
+    # If numeric dtype (int/float), convert integer-like floats to ints then to str
+    if pd.api.types.is_numeric_dtype(s):
+        nonnull = s.dropna()
+        try:
+            if not nonnull.empty and np.allclose(nonnull, np.round(nonnull)):
+                # integer-like floats or ints -> safe to cast to int then str
+                df[col] = s.where(s.isna(), s.round(0).astype(int).astype(str))
+            else:
+                # keep numeric but convert to string removing trailing .0
+                df[col] = s.astype(str).str.replace(r'\.0+$', '', regex=True).str.strip()
+        except Exception:
+            df[col] = s.astype(str).str.replace(r'\.0+$', '', regex=True).str.strip()
+    else:
+        # object/string dtype: remove trailing .0, commas, extra whitespace
+        s2 = s.astype(str).str.strip()
+        s2 = s2.str.replace(r'\.0+$', '', regex=True)
+        s2 = s2.str.replace(',', '', regex=False).str.strip()
+        s2 = s2.str.replace(r'\s+', ' ', regex=True)
+        df[col] = s2.replace({"nan": np.nan, "None": np.nan})
+
+
+def normalize_key_columns_for_join(df, extra_keywords=None):
+    """Auto-detect and normalize key-like columns in df (in-place)."""
+    # Generic trim for all object columns
+    for c in df.columns:
+        if pd.api.types.is_object_dtype(df[c]):
+            df[c] = df[c].astype(str).str.strip()
+
+    # Detect candidate semantic key columns
+    forced = detect_semantic_key_columns(df, extra_keywords=extra_keywords)
+    for col in forced:
+        normalize_key_column(df, col)
+
+    # Additional standardization for common categorical columns (optional)
+    # Title-case UW Unit-style columns and strip RI Type strings
+    for ucol in df.columns:
+        if ucol and isinstance(ucol, str) and re.search(r"uw|underwrit", ucol, re.IGNORECASE):
+            df[ucol] = df[ucol].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.title()
+    for rcol in df.columns:
+        if rcol and isinstance(rcol, str) and re.search(r"ri|reinsur|re-insur|ri type", rcol, re.IGNORECASE):
+            df[rcol] = df[rcol].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True)
+
+    return forced  # return the set of normalized columns
+
+
+# --- Apply accounting / presentation formatting ---
+def accounting_format(x):
+    """Format numeric values in accounting style: commas, 2 decimals, parentheses for negatives."""
+    try:
+        if pd.isna(x):
+            return ""
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            return f"({abs(x):,.2f})" if x < 0 else f"{x:,.2f}"
+        return x
+    except Exception:
+        return x
+
+def reconciliation_node(file1, file2):
+    # 1) Read inputs
+    df_A = _read_table(file1)
+    df_B = _read_table(file2)
+
+    # 2) Normalize header names (strip whitespace)
+    df_A.columns = [c.strip() if isinstance(c, str) else c for c in df_A.columns]
+    df_B.columns = [c.strip() if isinstance(c, str) else c for c in df_B.columns]
+
+    # 3) Detect semantic key columns and normalize them in-place
+    forced_A = normalize_key_columns_for_join(df_A, extra_keywords=["expo", "exposureyear", "exp_year"])
+    forced_B = normalize_key_columns_for_join(df_B, extra_keywords=["expo", "exposureyear", "exp_year"])
+
+    # Union of forced columns from both sides — ensure both sides normalized for the same keys
+    forced_union = set(forced_A) | set(forced_B)
+    for col in forced_union:
+        if col in df_A.columns:
+            normalize_key_column(df_A, col)
+        if col in df_B.columns:
+            normalize_key_column(df_B, col)
+
+    # 4) Determine numeric vs non-numeric columns (force union keys into non-numeric)
+    numeric_cols = []
+    non_numeric_cols = []
+    for col in df_A.columns:
+        if col in forced_union:
+            non_numeric_cols.append(col)
+            continue
+        # treat a column as numeric only if pandas considers it numeric
+        if pd.api.types.is_numeric_dtype(df_A[col]):
+            numeric_cols.append(col)
+        else:
+            non_numeric_cols.append(col)
+
+    # Safety: ensure we have at least one non-numeric key to join on
+    if len(non_numeric_cols) == 0:
+        raise ValueError("No non-numeric key columns detected to join on. Please ensure there are categorical key columns (e.g., UW Unit, Exposure Year, RI Type).")
+
+    # 5) Before merging, canonicalize non-numeric columns to string on both dfs to avoid dtype mismatches
+    # === normalize falsey placeholder strings into real NaN ===
+    pattern = r'^\s*(none|null|nan|na|nan\.0+)?\s*$'  # case-insensitive match for common empty-like tokens
+    for col in non_numeric_cols:
+        if col in df_A.columns:
+            df_A[col] = df_A[col].astype(str).str.strip()
+            # mask rows where the cell matches the placeholder pattern (case-insensitive)
+            mask_a = df_A[col].str.match(pattern, case=False, na=False)
+            df_A.loc[mask_a, col] = np.nan
+            # also convert empty strings to np.nan
+            df_A[col].replace('', np.nan, inplace=True)
+
+        if col in df_B.columns:
+            df_B[col] = df_B[col].astype(str).str.strip()
+            mask_b = df_B[col].str.match(pattern, case=False, na=False)
+            df_B.loc[mask_b, col] = np.nan
+            df_B[col].replace('', np.nan, inplace=True)
+
+    # Now drop source rows where ALL key columns are missing (invalid combos)
+    df_A = df_A[~df_A[non_numeric_cols].isna().all(axis=1)].copy()
+    df_B = df_B[~df_B[non_numeric_cols].isna().all(axis=1)].copy()
+
+    # === outer merge ===
+    merged = pd.merge(df_A, df_B, on=non_numeric_cols, how="outer", suffixes=("_A", "_B"))
+
+    # Defensive: remove merged rows where ALL join keys are missing (just in case)
+    if not merged.empty:
+        all_key_null_mask = merged[non_numeric_cols].isna().all(axis=1)
+        if all_key_null_mask.any():
+            # optional debug logging (uncomment in dev): print or store sample rows
+            # st.write("Dropping merged rows with empty keys:", merged.loc[all_key_null_mask, non_numeric_cols].head().to_dict(orient="records"))
+            merged = merged.loc[~all_key_null_mask].reset_index(drop=True)
+
+    # === compute missing lists ===
+    a_mask = merged.filter(like="_A").isna().any(axis=1)
+    b_mask = merged.filter(like="_B").isna().any(axis=1)
+
+    missing_in_A = merged.loc[a_mask, non_numeric_cols].drop_duplicates().reset_index(drop=True)
+    missing_in_B = merged.loc[b_mask, non_numeric_cols].drop_duplicates().reset_index(drop=True)
+
+    # Final presentation cleanup: drop any rows in missing lists that still contain NaN in any key
+    missing_in_A = missing_in_A.dropna(subset=non_numeric_cols).reset_index(drop=True)
+    missing_in_B = missing_in_B.dropna(subset=non_numeric_cols).reset_index(drop=True)
+
+
+    # Variance computation
+    variance_df = []
+    for col in numeric_cols:
+        merged[f"{col}_abs_diff"] = merged[f"{col}_A"] - merged[f"{col}_B"]
+        merged[f"{col}_pct_diff"] = ((merged[f"{col}_abs_diff"]) / (merged[f"{col}_B"].replace(0, np.nan))) * 100
+    # Build the variance DataFrame (includes non-numeric keys + all diff columns)
+    variance_df = merged[non_numeric_cols + [c for c in merged.columns if "_diff" in c]].copy()
+
+    # --- Keep only rows where at least one diff column is non-zero ---
+    diff_cols = [c for c in variance_df.columns if "_diff" in c]
+
+    # Drop rows where all diff columns are either NaN or 0
+    if diff_cols:
+        variance_df = variance_df.loc[
+            ~(variance_df[diff_cols].fillna(0).apply(lambda x: np.allclose(x, 0), axis=1))
+        ].reset_index(drop=True)
+
+    # Format all numeric diff columns
+    for col in diff_cols:
+        variance_df[col] = variance_df[col].apply(accounting_format)
+
+
+    # Variance summary
+    summary = {
+        "total_variance": merged[[f"{col}_abs_diff" for col in numeric_cols]].sum().to_dict(),
+        "avg_pct_diff": merged[[f"{col}_pct_diff" for col in numeric_cols]].mean().to_dict(),
+    }
+
+
+    # --- Prepare compact missing summaries for LLM ---
+    def summarize_missing(df, label):
+        """Convert a missing-combination DataFrame into a short human-readable list."""
+        if df.empty:
+            return f"No missing combinations in {label}."
+        # Convert to strings of key tuples for readability
+        sample_records = df.head(10).to_dict(orient="records")
+        text = ", ".join(
+            [" | ".join(str(v) for v in rec.values()) for rec in sample_records]
+        )
+        more_note = "" if len(df) <= 10 else f" ... and {len(df)-10} more."
+        return f"{len(df)} missing combinations in {label}: {text}{more_note}"
+
+    missing_summary_A = summarize_missing(missing_in_A, "Dataset A")
+    missing_summary_B = summarize_missing(missing_in_B, "Dataset B")
+
+    # Variance commentary (LLM)
+    prompt = f"""
+    You are a financial analyst reviewing quarterly reconciliation results.
+
+    Compare two Excel datasets and write a concise, professional financial commentary summarizinge:
+    - Overall variance across numeric fields
+    - Key increases/decreases
+    - Missing combinations in A and B
+
+    Summary stats:
+    {summary}
+
+    Sample variances:
+    {variance_df.head(5).to_dict(orient='records')}
+
+    Missing combination overview:
+    Missing combinations in A: {missing_summary_A}
+    Missing combinations in B: {missing_summary_B}
+    """
+    variance_commentary = call_llm(prompt)  # call your LLM here
 
     return {
-        **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
-        "sql_result": sql_df,
-        "sql_query": sql_query,
-        "web_links": web_links,
-        "general_summary": external_summary,
-        "comparison_summary": comparison_summary
+        "variance_df": variance_df,
+        "missing_in_A": missing_in_A,
+        "missing_in_B": missing_in_B,
+        "variance_summary": summary,
+        "variance_commentary": variance_commentary,
     }
+
+
+
+
+def comp_node(state: GraphState) -> GraphState:
+
+    file1 = state.get("uploaded_file1_path")
+    file2 = state.get("uploaded_file2_path")
+
+    # If 2 excels are attached → reconciliation flow
+    if file1 and file2:
+        reconciliation_result = reconciliation_node(file1, file2)
+        state["reconcile_df"] = reconciliation_result["variance_df"]
+        state["missing_in_A"] = reconciliation_result["missing_in_A"]
+        state["missing_in_B"] = reconciliation_result["missing_in_B"]
+        state["variance_summary"] = reconciliation_result["variance_summary"]
+        state["variance_commentary"] = reconciliation_result["variance_commentary"]
+        return state
+
+    else:
+        # 1) INTERNAL: build a safe Vanna prompt (internal-only)
+
+        schema_desc = get_schema_description('Actuarial_Data.db')
+        raw_prompt = state.get("vanna_prompt") or state["user_prompt"]
+
+        # Build a strict instruction block to prevent introspection
+        instruction_block = (
+            "IMPORTANT: You are only allowed to use the schema below — you must NOT inspect or read any rows from the database. "
+            "Do NOT request sample rows. Do NOT attempt to access the database for schema discovery. "
+            "Using only the schema below, produce a single valid SQL query (ANSI SQL or dialect I specify if needed) that returns "
+            "Return only the SQL; do not include explanation text."
+        )
+
+        combined_prompt = f"{schema_desc}\n\n{instruction_block}\n\nUser intent: {raw_prompt}\n\n"
+
+        sql_query = vn_model.generate_sql(combined_prompt)
+
+        try:
+            result = vn_model.run_sql(sql_query)
+            if isinstance(result, pd.DataFrame):
+                sql_df = result
+            elif isinstance(result, list):
+                sql_df = pd.DataFrame(result)
+            else:
+                sql_df = pd.DataFrame([{"Result": str(result)}])
+        except Exception as e:
+            sql_df = pd.DataFrame([{"Error": f"SQL Execution failed: {e}"}])
+
+        serp_result = serp_node({**state, "sql_query": sql_query, "sql_result": sql_df})
+
+        web_links = serp_result.get("web_links", [])
+        external_summary = serp_result.get("general_summary", "")
+
+        # 3) COMPARISON: clear separation + citations
+        comparison_prompt = f"""
+        You are an Benchmarking actuarial analyst. Compare OUR internal IBNR trend to EXTERNAL market/industry benchmarks.
+        Rules:
+        - Use INTERNAL SQL only for our numbers; do NOT infer market values from internal data.
+        - Use EXTERNAL WEB snippets only for market/industry values; if no numeric market average is found, say so explicitly.
+        - Put all money in **USD**, include **%/ratios/dates** where present.
+        - Append [i] citations for any external metric where i refers to the snippet index (shown below).
+        - If sources disagree, note the discrepancy briefly.
+
+        Your job is to:
+        1. Analyze differences, similarities, and gaps between internal company data and external web sources.
+        2. Focus heavily on **numerical metrics** such as:
+        - IBNR, Incurred Loss, Ultimate Loss
+        - Premiums, Loss Ratios
+        - Exposure Years, Percent changes
+
+        3. Focus more on:
+        - Trends (increases/decreases)
+        - Matching vs. diverging figures
+        - Numerical differences or % differences
+
+        Our internal (context only; do not reveal raw table):
+        SQL: {sql_query}
+        Top rows (context only):
+        {sql_df.head(5).to_markdown(index=False) if isinstance(sql_df, pd.DataFrame) else str(sql_df)}
+
+        External snippets (numbered):
+        {chr(10).join([f"[{i+1}] {s}" for i, (_, s) in enumerate(web_links)])}
+
+        Task:
+        1) 5–7 lines overview (internal vs market).
+        2) 3–5 bullets with side-by-side contrasts (Our vs Market) using USD/%/ratios and [citation] only for external numbers.
+        3) 1 “watch item” (e.g., social inflation, rate adequacy, reserving pressure) if relevant.
+
+        General external synthesis to leverage (do not copy verbatim; keep citations): 
+        {external_summary}
+        """
+        comparison_summary = call_llm(comparison_prompt).strip()
+
+        return {
+            **prune_state(state, STATE_KEYS_SET_AT_ENTRY),
+            "sql_result": sql_df,
+            "sql_query": sql_query,
+            "web_links": web_links,
+            "general_summary": external_summary,
+            "comparison_summary": comparison_summary
+        }
 
 
 
@@ -1115,7 +1564,7 @@ def run_sql_and_update_doc(
     col_headers = [cell.text.strip() for cell in old_table.rows[0].cells]
     st.write("col_headers")
     st.write(col_headers)
-    schema = get_schema_description('/Users/hp/OneDrive/Desktop/Python/SQLITE/AXA_Actuarial_Data/Actuarial_Data.db')
+    schema = get_schema_description('Actuarial_Data.db')
 
     #The user has asked: "{user_prompt}". 
     #User's instruction might have columns mentioned as well along with headers. Ignore those column names.
@@ -1721,6 +2170,139 @@ def generate_ppt(entry) -> BytesIO:
                     p.text = para.strip()
                     p.font.size = Pt(12)
 
+        # --- Reconciliation slides (Two-Excel flow) ---
+        if assistant_run.get("reconcile_df") or assistant_run.get("variance_commentary") or assistant_run.get("variance_summary"):
+            slide = prs.slides.add_slide(layout)
+            slide.shapes.title.text = f"Turn {idx}: Reconciliation Summary"
+
+            # Textbox for provenance and basic metadata
+            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.6))
+            tf = box.text_frame
+            tf.word_wrap = True
+
+            # Source files / timestamp
+            srcs = assistant_run.get("reconcile_source_files") or assistant_run.get("reconcile_source_files", [])
+            if srcs:
+                p = tf.paragraphs[0]
+                p.text = "Source files: " + ", ".join([os.path.basename(str(s)) for s in srcs])
+                p.font.size = Pt(11)
+            else:
+                p = tf.paragraphs[0]
+                p.text = f"Reconciliation run: {assistant_run.get('timestamp', '')}"
+                p.font.size = Pt(11)
+
+            # Variance commentary slide (if present) — short narrative from LLM
+            commentary = assistant_run.get("variance_commentary")
+            if commentary:
+                slide = prs.slides.add_slide(layout)
+                slide.shapes.title.text = f"Turn {idx}: Variance Commentary"
+                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(3.5))
+                tf = box.text_frame
+                tf.word_wrap = True
+                for para in str(commentary).split("\n"):
+                    if para.strip():
+                        p = tf.add_paragraph()
+                        p.text = para.strip()
+                        p.font.size = Pt(12)
+
+            # Variance summary (key metrics) — render as compact JSON-like text
+            summary = assistant_run.get("variance_summary")
+            if summary:
+                slide = prs.slides.add_slide(layout)
+                slide.shapes.title.text = f"Turn {idx}: Variance Summary"
+                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(2.2))
+                tf = box.text_frame
+                tf.word_wrap = True
+                p = tf.paragraphs[0]
+                p.text = "Top summary metrics:"
+                p.font.size = Pt(12)
+                try:
+                    # pretty-print top-level keys
+                    summary_text = json.dumps(summary, indent=2)
+                    p = tf.add_paragraph()
+                    p.text = summary_text[:3000]  # clip to reasonable length
+                    p.level = 1
+                    p.font.size = Pt(10)
+                except Exception:
+                    p = tf.add_paragraph()
+                    p.text = str(summary)[:3000]
+                    p.font.size = Pt(10)
+
+            # Main variance / reconciliation table: convert serialized forms as needed and add table slide
+            recon = assistant_run.get("reconcile_df")
+            if recon:
+                try:
+                    # If stored as list-of-dicts or dict, coerce to cols/rows using helper
+                    if isinstance(recon, (list, dict)):
+                        cols, rows = _rows_cols_from_serialized(recon)
+                        if rows:
+                            _add_table_slide(prs, f"Turn {idx}: Variance Table (top rows)", cols, rows, max_rows=6)
+                    elif isinstance(recon, pd.DataFrame):
+                        cols, rows = _rows_cols_from_serialized(recon)
+                        if rows:
+                            _add_table_slide(prs, f"Turn {idx}: Variance Table (top rows)", cols, rows, max_rows=6)
+                    else:
+                        # try best-effort coercion
+                        cols, rows = _rows_cols_from_serialized(recon)
+                        if rows:
+                            _add_table_slide(prs, f"Turn {idx}: Variance Table (top rows)", cols, rows, max_rows=6)
+                except Exception:
+                    # safe fallback: include a short note if table could not be rendered
+                    slide = prs.slides.add_slide(layout)
+                    slide.shapes.title.text = f"Turn {idx}: Variance Table"
+                    box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.5))
+                    tf = box.text_frame
+                    tf.word_wrap = True
+                    p = tf.paragraphs[0]
+                    p.text = "Variance table present but could not be rendered in PPT. Please download the CSV from the session artifacts."
+                    p.font.size = Pt(11)
+            
+        # --- Missing combinations slides (if present) ---
+        missing_a = assistant_run.get("missing_in_A")
+        missing_b = assistant_run.get("missing_in_B")
+
+        # Missing in A (present in B)
+        if missing_a:
+            try:
+                cols_a, rows_a = _rows_cols_from_serialized(missing_a)
+                if rows_a:
+                    _add_table_slide(prs, f"Turn {idx}: Missing in A (present in B) - top rows", cols_a, rows_a, max_rows=8)
+                else:
+                    # If no rows after serialization, add a note slide
+                    slide = prs.slides.add_slide(layout)
+                    slide.shapes.title.text = f"Turn {idx}: Missing in A (present in B)"
+                    box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.0))
+                    tf = box.text_frame
+                    tf.text = "No example rows available for Missing-in-A."
+            except Exception:
+                slide = prs.slides.add_slide(layout)
+                slide.shapes.title.text = f"Turn {idx}: Missing in A (present in B)"
+                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.5))
+                tf = box.text_frame
+                tf.word_wrap = True
+                tf.text = "Missing-in-A table present but could not be rendered. Please download the CSV from the session artifacts."
+
+        # Missing in B (present in A)
+        if missing_b:
+            try:
+                cols_b, rows_b = _rows_cols_from_serialized(missing_b)
+                if rows_b:
+                    _add_table_slide(prs, f"Turn {idx}: Missing in B (present in A) - top rows", cols_b, rows_b, max_rows=8)
+                else:
+                    slide = prs.slides.add_slide(layout)
+                    slide.shapes.title.text = f"Turn {idx}: Missing in B (present in A)"
+                    box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.0))
+                    tf = box.text_frame
+                    tf.text = "No example rows available for Missing-in-B."
+            except Exception:
+                slide = prs.slides.add_slide(layout)
+                slide.shapes.title.text = f"Turn {idx}: Missing in B (present in A)"
+                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.5))
+                tf = box.text_frame
+                tf.word_wrap = True
+                tf.text = "Missing-in-B table present but could not be rendered. Please download the CSV from the session artifacts."
+
+
         # --- Web links (search/comp) ---
         web_links = assistant_run.get("web_links") or assistant_run.get("result") if route == "search" else assistant_run.get("web_links")
         if web_links:
@@ -1962,6 +2544,7 @@ def _render_faiss_block(entry):
                         )
 
 def _render_run_by_route(run):
+    import pandas as pd
     """Render the assistant_run (the full per-turn run_record) according to its route.
        This mirrors the previous single-entry rendering but scoped to a run record."""
     route = run.get("route")
@@ -1977,26 +2560,125 @@ def _render_run_by_route(run):
             st.subheader("🧾 SQL Query:")
             st.code(run["sql_query"], language="sql")
 
-        st.subheader("SQL Query Result:")
-        result_df = run.get("result")
-        formatted = _format_dataframe_for_display(result_df)
-        if isinstance(formatted, pd.DataFrame):
-            st.dataframe(formatted)
-        else:
-            st.text(formatted if formatted is not None else "_No result returned_")
+            st.subheader("SQL Query Result:")
+            result_df = run.get("result")
+            formatted = _format_dataframe_for_display(result_df)
+            if isinstance(formatted, pd.DataFrame):
+                st.dataframe(formatted)
+            else:
+                st.text(formatted if formatted is not None else "_No result returned_")
 
         # For comparison runs, show summaries and web links if present
         if route == "comp":
-            if run.get("general_summary"):
-                st.subheader("🧠 General Summary:")
-                st.markdown(run["general_summary"])
-            st.subheader("🔗 Top Web Links:")
-            for i, (link, summary) in enumerate(run.get("web_links") or [], 1):
-                st.markdown(f"**{i}.** {link}")
-                st.markdown(f"_Summary:_\n{summary}")
-            if run.get("comparison_summary"):
-                st.subheader("🆚 Comparison Summary:")
-                st.markdown(run["comparison_summary"])
+             # If reconciliation outputs exist (two-excel flow), show those first
+            if run.get("reconcile_df") or run.get("reconcile_source_files"):
+                st.subheader("🔁 Reconciliation (Two Excel Files)")
+
+                # Show provenance / source files if available
+                # srcs = run.get("reconcile_source_files") or []
+                # if srcs:
+                #     st.markdown("**Source files:**")
+                #     for i, s in enumerate(srcs, 1):
+                #         st.markdown(f"- {i}. `{s}`")
+
+                # Variance commentary (LLM-generated) — show first for quick context
+
+                # Missing combinations in A / B
+                missing_a = run.get("missing_in_A")
+                missing_b = run.get("missing_in_B")
+                if missing_a:
+                    st.subheader("⚠️ Missing combinations in A (present in B)")
+                    formatted_a = _format_dataframe_for_display(missing_a)
+                    if isinstance(formatted_a, pd.DataFrame):
+                        st.dataframe(formatted_a)
+                        try:
+                            csv_a = formatted_a.to_csv(index=False).encode("utf-8")
+                            st.download_button("Download missing_in_A (CSV)", data=csv_a, file_name="missing_in_A.csv", mime="text/csv")
+                        except Exception:
+                            pass
+                    else:
+                        st.write(formatted_a)
+                if missing_b:
+                    st.subheader("⚠️ Missing combinations in B (present in A)")
+                    formatted_b = _format_dataframe_for_display(missing_b)
+                    if isinstance(formatted_b, pd.DataFrame):
+                        st.dataframe(formatted_b)
+                        try:
+                            csv_b = formatted_b.to_csv(index=False).encode("utf-8")
+                            st.download_button("Download missing_in_B (CSV)", data=csv_b, file_name="missing_in_B.csv", mime="text/csv")
+                        except Exception:
+                            pass
+                    else:
+                        st.write(formatted_b)
+
+
+                # Main variance / reconciliation table
+                recon_df = run.get("reconcile_df")
+                if recon_df is not None:
+                    st.subheader("📋 Variance Table (by combination)")
+                    # formatted may already be serialized (list-of-dicts) in history; convert back if needed
+                    try:
+                        import pandas as pd
+                        if isinstance(recon_df, list):
+                            display_df = pd.DataFrame(recon_df)
+                        elif isinstance(recon_df, dict):
+                            display_df = pd.DataFrame([recon_df])
+                        elif isinstance(recon_df, pd.DataFrame):
+                            display_df = recon_df
+                        else:
+                            display_df = _format_dataframe_for_display(recon_df)
+                    except Exception:
+                        display_df = _format_dataframe_for_display(recon_df)
+
+                    if isinstance(display_df, pd.DataFrame):
+                        # 🔹 Keep only rows with at least one non-zero numeric variance
+                        numeric_cols = display_df.select_dtypes(include="number").columns
+                        if len(numeric_cols) > 0:
+                            # Replace NaN with 0 for the check, then keep any row where a numeric col != 0
+                            filtered_df = display_df.loc[(display_df[numeric_cols].fillna(0) != 0).any(axis=1)]
+                        else:
+                            filtered_df = display_df  # no numeric columns, show as-is
+
+                        st.dataframe(filtered_df)
+                        # Provide CSV download for the user
+                        try:
+                            csv_bytes = filtered_df.to_csv(index=False).encode("utf-8")
+                            st.download_button("Download Variance Table (CSV)", data=csv_bytes, file_name="reconciliation_variance.csv", mime="text/csv")
+                        except Exception:
+                            pass
+                    else:
+                        st.write(display_df)
+
+
+                # Variance summary
+                summary = run.get("variance_summary")
+                if summary:
+                    st.subheader("📊 Variance Summary")
+                    try:
+                        st.json(summary)
+                    except Exception:
+                        st.write(summary)
+
+
+                # Variance Commentary
+                commentary = run.get("variance_commentary")
+                if commentary:
+                    st.subheader("📝 Variance Commentary")
+                    st.markdown(commentary)
+
+                
+            #SQL vs WEB
+            else:
+                if run.get("general_summary"):
+                    st.subheader("🧠 General Summary:")
+                    st.markdown(run["general_summary"])
+                st.subheader("🔗 Top Web Links:")
+                for i, (link, summary) in enumerate(run.get("web_links") or [], 1):
+                    st.markdown(f"**{i}.** {link}")
+                    st.markdown(f"_Summary:_\n{summary}")
+                if run.get("comparison_summary"):
+                    st.subheader("🆚 Comparison Summary:")
+                    st.markdown(run["comparison_summary"])
 
     elif route == "faissdb":
         # faissdb runs may be stored within a run or (for older entries) at the top-level entry.
@@ -2062,7 +2744,7 @@ graph_builder.add_edge("faissdb", END)
 agent_graph = graph_builder.compile()
 
 # ---- Streamlit UI ----
-st.title("\U0001F9E0 Project ASTRA")
+st.title("\U0001F9E0 Agentic AI Assistant (Insurance)")
 
 
 def format_date_label(chat_date: date) -> str:
@@ -2300,10 +2982,10 @@ if st.session_state.active_chat_index is None:
 
     with st.form(key="query_form"):
         user_prompt = st.text_input("Enter your query:")
-        doc_file = st.file_uploader("Upload Insurance Document (.docx)", type=["docx"])
+        #doc_file = st.file_uploader("Upload Insurance Document (.docx)", type=["docx"])
+        uploaded_file1 = st.file_uploader("Attach first Excel file", type=["docx", "xlsx", "xls", "csv"], key="file1")
+        uploaded_file2 = st.file_uploader("Attach second Excel file", type=["docx", "xlsx", "xls", "csv"], key="file2")
         submitted = st.form_submit_button("Run Agent")
-    #user_prompt = st.text_input("Enter your query:", key="user_prompt")
-    #doc_file = st.file_uploader("Upload Insurance Document (.docx)", type=["docx"])
 
 
     if submitted:
@@ -2314,19 +2996,52 @@ if st.session_state.active_chat_index is None:
     #):
         st.session_state["last_prompt"] = user_prompt
 
-        if doc_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-                tmp.write(doc_file.read())
-                doc_path = tmp.name
-        else:
-            doc_path = None
+        # Persist uploaded files to temp paths so downstream nodes can use file paths
+        file1_path = None
+        file2_path = None
+        uploaded_file1_is_excel = False
+        uploaded_file2_is_excel = False
+
+        if uploaded_file1 is not None:
+            # Extract and normalize the file extension
+            ext1 = uploaded_file1.name.split(".")[-1].lower().strip()
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix="." + (uploaded_file1.name.split(".")[-1])) as tmp1:
+                tmp1.write(uploaded_file1.read())
+                file1_path = tmp1.name
+                
+                # Set flag based on extension
+                uploaded_file1_is_excel = ext1 in ["xls", "xlsx", "csv"]
+
+        if uploaded_file2 is not None:
+            ext2 = uploaded_file2.name.split(".")[-1].lower().strip()
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix="." + (uploaded_file2.name.split(".")[-1])) as tmp2:
+                tmp2.write(uploaded_file2.read())
+                file2_path = tmp2.name
+                
+                # Set flag based on extension
+                uploaded_file2_is_excel = ext2 in ["xls", "xlsx", "csv"]
+
+        # if doc_file:
+        #     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+        #         tmp.write(doc_file.read())
+        #         doc_path = tmp.name
+        # else:
+        #     doc_path = None
 
 
         state: GraphState = {
             # Core inputs
             "user_prompt": user_prompt,
-            "doc_loaded": doc_path is not None,
-            "document_path": doc_path,
+            "uploaded_file1": uploaded_file1,        # raw UploadedFile object (optional)
+            "uploaded_file2": uploaded_file2,        # raw UploadedFile object (optional)
+            "uploaded_file1_path": file1_path,       # filesystem path to temp file (or None)
+            "uploaded_file2_path": file2_path,       # filesystem path to temp file (or None)
+            "uploaded_file1_is_excel": uploaded_file1_is_excel,         # True if file1 appears excel/csv-like
+            "uploaded_file2_is_excel": uploaded_file2_is_excel,         # True if file2 appears excel/csv-like
+#            "doc_loaded": doc_path is not None,
+#            "document_path": doc_path,
 
             # Prompts
             "vanna_prompt": None,
@@ -2363,6 +3078,16 @@ if st.session_state.active_chat_index is None:
             "faiss_summary": None,
             "faiss_sources": None,
             "faiss_images": None,
+
+            # --- Reconciliation-specific placeholders ---
+            # These will be filled by comp_node / reconciliation_node when two files are attached
+
+            "reconcile_df": None,              # full variance table (pandas DataFrame)
+            "missing_in_A": None,              # DataFrame or list-of-dicts
+            "missing_in_B": None,              # DataFrame or list-of-dicts
+            "variance_summary": None,          # dict with totals/aggregates
+            "variance_commentary": None,       # LLM-generated narrative text
+            "reconcile_source_files": [file1_path, file2_path],  # for provenance
         }
 
         with st.spinner("Running Agent..."):
@@ -2427,6 +3152,14 @@ if st.session_state.active_chat_index is None:
             "faiss_sources": output.get("faiss_sources"),
             "faiss_images": output.get("faiss_images"),
 
+            # Reconciliation-specific serialized outputs (if available)
+            "reconcile_df": safe_serialize_preview_df(output.get("reconcile_df")),
+            "missing_in_A": safe_serialize_preview_df(output.get("missing_in_A")),
+            "missing_in_B": safe_serialize_preview_df(output.get("missing_in_B")),
+            "variance_summary": output.get("variance_summary"),
+            "variance_commentary": output.get("variance_commentary"),
+            "reconcile_source_files": output.get("reconcile_source_files", [file1_path, file2_path]),
+
             # any additional custom fields the nodes may emit
             "extra": output.get("extra", {}),
 
@@ -2445,7 +3178,6 @@ if st.session_state.active_chat_index is None:
 
         # Mark that agent ran (for UI)
         st.session_state.just_ran_agent = True
-
 
         #Render workflow + live session (reverse-chronological, assistant-first) ----------
         col_left, col_mid, col_right = st.columns([4, 0.4, 1.5])
@@ -2672,14 +3404,3 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
-
-
-
-
-
-
-
-
-
-
-
