@@ -2571,7 +2571,10 @@ def _render_run_by_route(run):
         # For comparison runs, show summaries and web links if present
         if route == "comp":
              # If reconciliation outputs exist (two-excel flow), show those first
-            if run.get("reconcile_df") or run.get("reconcile_source_files"):
+            file1 = state.get("uploaded_file1_path")
+            file2 = state.get("uploaded_file2_path")
+
+            if file1 and file2:
                 st.subheader("🔁 Reconciliation (Two Excel Files)")
 
                 # Show provenance / source files if available
@@ -3404,3 +3407,4 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
+
