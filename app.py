@@ -3301,7 +3301,7 @@ if st.session_state.active_chat_index is None:
                             st.text("_No assistant output available for this turn_")
 
                     # Then show corresponding user prompt below the assistant output
-                    user_prompt = turn.get("user_prompt") or turn.get("text") or turn.get("prompt") or ""
+                    user_prompt = turn.get("user_prompt")
                     if user_prompt:
                         st.markdown(f"**You:** {user_prompt}")
 
@@ -3417,3 +3417,4 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
+
