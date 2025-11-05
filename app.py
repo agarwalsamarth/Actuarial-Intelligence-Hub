@@ -1,3 +1,4 @@
+
 import streamlit as st
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Optional, List
@@ -146,6 +147,7 @@ class GraphState(TypedDict):
     missing_in_B: Optional[pd.DataFrame]
     variance_summary: Optional[dict]
     variance_commentary: Optional[str]
+    comp_type: Optional[str]
 
 
 def get_schema_description(db_path: str) -> str:
@@ -251,8 +253,7 @@ STATE_KEYS_SET_AT_ENTRY = [
     # "variance_summary",
     # "variance_commentary",
     # "reconcile_source_files",
-
-
+    # "comp_type"
 ]
 
 # --- short-circuit: if both uploads exist and look like excel/csv, route deterministically to comp ---
@@ -1107,6 +1108,12 @@ def comp_node(state: GraphState) -> GraphState:
     file1 = state.get("uploaded_file1_path")
     file2 = state.get("uploaded_file2_path")
 
+    # --- Determine Comp Node Type ---
+    if file1 and file2:
+        comp_type = "EXCEL-EXCEL"
+    else:
+        comp_type = "SQL-WEB"
+
     # If 2 excels are attached → reconciliation flow
     if file1 and file2:
         reconciliation_result = reconciliation_node(file1, file2)
@@ -1115,6 +1122,7 @@ def comp_node(state: GraphState) -> GraphState:
         state["missing_in_B"] = reconciliation_result["missing_in_B"]
         state["variance_summary"] = reconciliation_result["variance_summary"]
         state["variance_commentary"] = reconciliation_result["variance_commentary"]
+        state["comp_type"] = comp_type
         return state
 
     else:
@@ -1197,7 +1205,8 @@ def comp_node(state: GraphState) -> GraphState:
             "sql_query": sql_query,
             "web_links": web_links,
             "general_summary": external_summary,
-            "comparison_summary": comparison_summary
+            "comparison_summary": comparison_summary,
+            "comp_type": comp_type
         }
 
 
@@ -2571,10 +2580,9 @@ def _render_run_by_route(run):
         # For comparison runs, show summaries and web links if present
         if route == "comp":
              # If reconciliation outputs exist (two-excel flow), show those first
-            file1 = state.get("uploaded_file1_path")
-            file2 = state.get("uploaded_file2_path")
-
-            if file1 and file2:
+            comp_type = run.get("comp_type", "SQL-WEB")   
+            #if run.get("reconcile_df") or run.get("reconcile_source_files"):
+            if comp_type == "EXCEL-EXCEL":
                 st.subheader("🔁 Reconciliation (Two Excel Files)")
 
                 # Show provenance / source files if available
@@ -3091,6 +3099,7 @@ if st.session_state.active_chat_index is None:
             "variance_summary": None,          # dict with totals/aggregates
             "variance_commentary": None,       # LLM-generated narrative text
             "reconcile_source_files": [file1_path, file2_path],  # for provenance
+            "comp_type": None
         }
 
         with st.spinner("Running Agent..."):
@@ -3156,6 +3165,7 @@ if st.session_state.active_chat_index is None:
             "faiss_images": output.get("faiss_images"),
 
             # Reconciliation-specific serialized outputs (if available)
+            "comp_type": output.get("comp_type"),
             "reconcile_df": safe_serialize_preview_df(output.get("reconcile_df")),
             "missing_in_A": safe_serialize_preview_df(output.get("missing_in_A")),
             "missing_in_B": safe_serialize_preview_df(output.get("missing_in_B")),
@@ -3407,4 +3417,3 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
-
