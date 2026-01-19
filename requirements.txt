@@ -11,7 +11,7 @@ transformers>=4.40.0
 tiktoken>=0.5.1
 
 # === Vanna AI ===
-vanna>=0.4.16
+vanna==0.3.3
 
 # === Search Tools ===
 serpapi>=0.1.5
@@ -49,3 +49,4 @@ openpyxl
 # venv\Scripts\activate
 # Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 # venv\Scripts\Activate.ps1
+
