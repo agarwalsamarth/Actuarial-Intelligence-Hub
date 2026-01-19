@@ -1,55 +1,51 @@
-# Core LangGraph & LangChain
+# === Core LangGraph & LangChain ===
 langgraph>=0.0.30
 langchain>=0.1.20
 langchain-core>=0.1.50
 langchain-community>=0.0.38
 
-# LLMs
+# === LLMs & Embeddings ===
 openai>=1.3.0
 huggingface-hub>=0.21.4
 transformers>=4.40.0
+tiktoken>=0.5.1
 
-# SerpAPI (you can still use it or skip if replacing with GoogleSearch)
+# === Vanna AI ===
+vanna>=0.4.16
+
+# === Search Tools ===
 serpapi>=0.1.5
 google-search-results
 requests>=2.31.0
 
-# Vanna AI
-vanna>=0.4.16
-
-# Document parsing
-python-docx>=1.1.0
+# === Document Parsing ===
 unstructured>=0.10.25
-
-# Streamlit for UI
-streamlit>=1.34.0
-
-# .env API Keys
-python-dotenv
-
-# Workflow Visualization
-matplotlib==3.10.3
-networkx==3.5
-
-#Powerpoint
+python-docx>=1.1.0
 python-pptx
-
-# Vector DB for internal document search
-tiktoken>=0.5.1
-faiss-cpu>=1.7.4
-
 
 # === OCR & Image Processing (No sudo required) ===
 easyocr
 Pillow>=9.0.0
+# pdf2image  # Optional: Use only if Poppler is available locally
 
+# === Streamlit UI ===
+streamlit>=1.34.0
+python-dotenv
 
-# Optional: Uncomment if you face Pydantic-related issues
-# pydantic<2
+# === Vector DB ===
+faiss-cpu>=1.7.4
 
-#code for venv
-#python -m venv venv
-#venv\Scripts\activate
-#Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-#venv\Scripts\Activate.ps1
+# === Visualization ===
+matplotlib==3.10.3
+networkx==3.5
 
+# --reading excel
+openpyxl
+# === Optional Fixes ===
+# pydantic<2  # Uncomment only if Pydantic version issues arise
+
+# === Virtual Env Notes ===
+# python -m venv venv
+# venv\Scripts\activate
+# Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+# venv\Scripts\Activate.ps1
