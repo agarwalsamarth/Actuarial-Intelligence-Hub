@@ -2669,8 +2669,8 @@ def _render_faiss_block(entry):
 
 def _render_run_by_route(run):
     import pandas as pd
-    """Render the assistant_run (the full per-turn run_record) according to its route.
-       This mirrors the previous single-entry rendering but scoped to a run record."""
+    #"""Render the assistant_run (the full per-turn run_record) according to its route.
+    #   This mirrors the previous single-entry rendering but scoped to a run record."""
     route = run.get("route")
     # For SQL-like or document-like routes, we show sql and result
     if route in ["sql", "document", "comp"]:
@@ -3534,3 +3534,4 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
+
