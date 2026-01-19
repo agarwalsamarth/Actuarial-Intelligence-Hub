@@ -1,4 +1,3 @@
-
 import streamlit as st
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Optional, List
@@ -45,6 +44,11 @@ from urllib.parse import urlparse
 import io
 import re
 from difflib import get_close_matches
+from pptx.util import Inches, Pt
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.dml.color import RGBColor
+import math
 
 st.set_page_config(layout="wide")
 
@@ -1935,71 +1939,247 @@ def _rows_cols_from_serialized(df_like):
     return ["value"], [[str(df_like)]]
 
 
+#++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# ---- Visual style ----
+FONT_TITLE = "Segoe UI"
+FONT_BODY  = "Segoe UI"
+COLOR_TITLE = RGBColor(30, 30, 30)
+COLOR_TEXT  = RGBColor(45, 45, 45)
+COLOR_TBL_HEADER_BG = RGBColor(230, 234, 239)
+COLOR_TBL_HEADER_TX = RGBColor(20, 20, 20)
+COLOR_TBL_ROW_ALT   = RGBColor(247, 249, 251)
+# Subtle background and title frame
+COLOR_BG            = RGBColor(248, 249, 251)   # off-white/gray
+COLOR_TITLE_FRAME   = RGBColor(200, 205, 210)   # soft gray line
+TITLE_FRAME_LINE_W  = Pt(2)
+TITLE_FRAME_PAD_X   = Pt(6)
+TITLE_FRAME_PAD_Y   = Pt(4)
+
+# Content geometry (keeps things consistent)
+SLIDE_MARGIN_LEFT   = Inches(0.6)
+SLIDE_MARGIN_RIGHT  = Inches(0.6)
+CONTENT_TOP         = Inches(1.7)
+CONTENT_W           = Inches(10) - SLIDE_MARGIN_LEFT - SLIDE_MARGIN_RIGHT
+CONTENT_H           = Inches(5.2)
+
+# limits
+TOP_N = 5
+MAX_ROWS_PER_SLIDE = 12      # including header row
+# MAX_COLS_PER_SLIDE = 6       # show at most 6 columns per slide; rest go to next slide
+
+def _cell_text(cell, text, *, size=11, bold=False, align=PP_ALIGN.LEFT, color=COLOR_TEXT):
+    tf = cell.text_frame
+    tf.clear()
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    r = p.add_run()
+    r.text = "" if text is None else str(text)
+    r.font.name = FONT_BODY
+    r.font.size = Pt(size)
+    r.font.bold = bold
+    r.font.color.rgb = color
+    p.alignment = align
+    try:
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    except Exception:
+        pass
+    # inner padding (some python-pptx versions support these)
+    for attr, val in (("margin_left", Pt(2)), ("margin_right", Pt(2)), ("margin_top", Pt(2)), ("margin_bottom", Pt(2))):
+        try:
+            setattr(tf, attr, val)
+        except Exception:
+            pass
+
+def _fill_cell(cell, rgb):
+    cell.fill.solid()
+    cell.fill.fore_color.rgb = rgb
+
+def _autofit_widths(table):
+    """Proportionally set column widths by character length."""
+    cols = table.columns
+    rows = table.rows
+    weights = []
+    for j in range(len(cols)):
+        mx = 1
+        for i in range(len(rows)):
+            try:
+                t = rows[i].cells[j].text or ""
+            except Exception:
+                t = ""
+            mx = max(mx, len(t))
+        weights.append(mx)
+    total = float(sum(weights)) or 1.0
+    for j, w in enumerate(weights):
+        cols[j].width = int(CONTENT_W * (w / total))        
+
+def _chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield i, lst[i:i+n]
+
+def _apply_professional_background(slide):
+    bg = slide.background
+    fill = bg.fill
+    fill.solid()
+    fill.fore_color.rgb = COLOR_BG
+
+def _add_slide(prs, layout):
+    slide = prs.slides.add_slide(layout)
+    _apply_professional_background(slide)
+    return slide
+
+def _ensure_title_shape(slide):
+    """Return a usable title shape; create one if layout lacks a title."""
+    shape = slide.shapes.title
+    if shape is None:
+        shape = slide.shapes.add_textbox(SLIDE_MARGIN_LEFT, Inches(0.6), CONTENT_W, Inches(0.95))
+    return shape
+
+def _apply_title_text(shape, text, size=34):
+    if shape is None or not getattr(shape, "has_text_frame", False):
+        return
+    tf = shape.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    r = p.add_run()
+    r.text = text
+    r.font.name = FONT_TITLE
+    r.font.size = Pt(size)
+    r.font.bold = True
+    r.font.color.rgb = COLOR_TITLE
+
+def _add_title_frame(slide, title_shape):
+    """Draw a rounded-rectangle outline around the title."""
+    if title_shape is None:
+        return
+    left  = max(0, title_shape.left  - TITLE_FRAME_PAD_X)
+    top   = max(0, title_shape.top   - TITLE_FRAME_PAD_Y)
+    width = title_shape.width  + 2 * TITLE_FRAME_PAD_X
+    height= title_shape.height + 2 * TITLE_FRAME_PAD_Y
+
+    rect = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, left, top, width, height)
+    rect.fill.background()  # transparent fill
+    rect.line.color.rgb = COLOR_TITLE_FRAME
+    rect.line.width = TITLE_FRAME_LINE_W
+
+def _set_title(slide, text, size=34, frame=True):
+    """Use this for ALL slide titles."""
+    t = _ensure_title_shape(slide)
+    _apply_title_text(t, text, size=size)
+    if frame:
+        _add_title_frame(slide, t)
+
 def _add_table_slide(prs, title, columns, rows, max_rows=6):
     """
-    Adds a slide with a table safely.
-    - columns: list[str] or []
-    - rows: list[list[str]] where each row may have variable length
-    - max_rows: maximum number of data rows to show (headers + data <= max_rows)
+    Adds a slide with a well-formatted table.
+    - Shows ONLY the first TOP_N rows.
+    - Never splits columns; all columns appear on the same slide.
+    - Wraps text, auto-fits column widths, and adjusts font size if many columns.
     """
-    layout = prs.slide_layouts[5]  # title + content
+    layout = prs.slide_layouts[5]  # Title Only
     slide = prs.slides.add_slide(layout)
-    slide.shapes.title.text = title
+    try:
+        # If you have _set_title for framed titles, use it:
+        _set_title(slide, title)
+    except Exception:
+        slide.shapes.title.text = title  # fallback if you didn't add _set_title
 
-    # Normalize rows to list of lists of strings
+    # Normalize rows -> list[list[str]]
     norm_rows = []
     for r in rows or []:
         if isinstance(r, dict):
-            # if row is dict, map by columns if available
             if columns:
-                norm_rows.append([str(r.get(c, "")) for c in columns])
+                norm_rows.append([("" if r.get(c) is None else str(r.get(c))) for c in columns])
             else:
-                # dict -> preserve order of keys
-                norm_rows.append([str(v) for v in r.values()])
+                norm_rows.append([("" if v is None else str(v)) for v in r.values()])
         elif isinstance(r, (list, tuple)):
-            norm_rows.append(["" if v is None else str(v) for v in r])
+            norm_rows.append([("" if v is None else str(v)) for v in r])
         else:
-            norm_rows.append([str(r)])
+            norm_rows.append([("" if r is None else str(r))])
 
-    # If preview columns provided use them; otherwise infer from data
-    if columns:
-        n_cols = max(1, len(columns))
+    # Use provided columns or infer max length from data
+    if columns and len(columns) > 0:
+        hdr = [str(c) for c in columns]
+        n_cols = len(hdr)
     else:
-        # infer columns as max row length
         n_cols = max((len(r) for r in norm_rows), default=1)
+        hdr = [f"Col {i+1}" for i in range(n_cols)]
 
-    # truncate data rows to fit on slide (reserve one row for header if columns present)
-    max_data_rows = max_rows - (1 if columns else 0)
-    if max_data_rows < 0:
-        max_data_rows = 0
-    display_rows = norm_rows[:max_data_rows]
+    # ---- Limit to TOP_N rows (hard cap) ----
+    norm_rows = norm_rows[:TOP_N]
 
-    n_rows = len(display_rows) + (1 if columns else 0)
-    if n_rows == 0:
-        # nothing to show
-        return
+    # Compute how many rows we can place (header + body) per slide
+    rows_per_page = max(1, MAX_ROWS_PER_SLIDE - 1)  # body rows; keep 1 for header
+    total_pages = max(1, math.ceil(len(norm_rows) / rows_per_page))
 
-    # Create table: rows x cols
-    # Use reasonable slide area
-    left, top, width, height = Inches(0.5), Inches(1.2), Inches(8.5), Inches(3.5)
-    table_shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
-    table = table_shape.table
+    left, top, width, height = SLIDE_MARGIN_LEFT, CONTENT_TOP, CONTENT_W, Inches(3.8)
 
-    # Fill header if present
-    if columns:
-        for ci in range(n_cols):
-            text = columns[ci] if ci < len(columns) else ""
-            table.cell(0, ci).text = str(text)
+    for page_idx in range(total_pages):
+        start = page_idx * rows_per_page
+        chunk = norm_rows[start:start + rows_per_page]
 
-    # Fill body safely (guard indices)
-    start_row = 1 if columns else 0
-    for ri, row in enumerate(display_rows):
-        for ci in range(n_cols):
-            text = row[ci] if ci < len(row) else ""
-            table.cell(start_row + ri, ci).text = str(text)
+        # Add a page badge if we actually paginated by rows (rare if TOP_N=5)
+        if total_pages > 1 and page_idx > 0:
+            slide = prs.slides.add_slide(layout)
+            try:
+                _set_title(slide, f"{title} (Page {page_idx+1}/{total_pages})")
+            except Exception:
+                slide.shapes.title.text = f"{title} (Page {page_idx+1}/{total_pages})"
 
-    return table
+        # Build table
+        n_rows = len(chunk) + 1  # header + data
+        table_shape = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
+        table = table_shape.table
 
+        # Dynamic font sizes for many columns
+        header_size = 12 if n_cols <= 7 else (11 if n_cols <= 10 else 10)
+        body_size   = 11 if n_cols <= 7 else (10 if n_cols <= 10 else 9)
+
+        # Header
+        for j, h in enumerate(hdr):
+            cell = table.cell(0, j)
+            _cell_text(cell, h, size=header_size, bold=True, align=PP_ALIGN.CENTER, color=COLOR_TBL_HEADER_TX)
+            _fill_cell(cell, COLOR_TBL_HEADER_BG)
+
+        # Body
+        for i, r in enumerate(chunk, start=1):
+            for j in range(n_cols):
+                val = r[j] if j < len(r) else ""
+                cell = table.cell(i, j)
+                _cell_text(cell, val, size=body_size, bold=False, align=PP_ALIGN.LEFT, color=COLOR_TEXT)
+            # zebra striping
+            if i % 2 == 1:
+                for j in range(n_cols):
+                    _fill_cell(table.cell(i, j), COLOR_TBL_ROW_ALT)
+
+        # Columns: proportional widths to fit CONTENT_W
+        _autofit_widths(table)
+
+def _add_text_block(slide, top=CONTENT_TOP, height=CONTENT_H):
+    """Creates a word-wrapped body text box with nice defaults."""
+    box = slide.shapes.add_textbox(SLIDE_MARGIN_LEFT, top, CONTENT_W, height)
+    tf = box.text_frame
+    tf.clear()
+    tf.word_wrap = True
+    tf.margin_left   = Pt(2)
+    tf.margin_right  = Pt(2)
+    tf.margin_top    = Pt(2)
+    tf.margin_bottom = Pt(2)
+    return tf
+
+def _add_body_paragraph(tf, text, size=14, before=4, after=6, bold=False):
+    p = tf.add_paragraph() if len(tf.paragraphs) else tf.paragraphs[0]
+    p.text = ""
+    r = p.add_run()
+    r.text = text
+    r.font.name = FONT_TITLE
+    r.font.size = Pt(size)
+    r.font.bold = bold
+    r.font.color.rgb = COLOR_TEXT
+    p.space_before = Pt(before)
+    p.space_after  = Pt(after)
+    p.alignment = PP_ALIGN.LEFT
+    tf.word_wrap = True
+    return p
 
 #Exporting data to Powerpoint
 def generate_ppt(entry) -> BytesIO:
@@ -2012,8 +2192,9 @@ def generate_ppt(entry) -> BytesIO:
     layout = prs.slide_layouts[5]
 
     # Title slide for the session
-    slide = prs.slides.add_slide(prs.slide_layouts[0])
-    slide.shapes.title.text = "Agentic AI Report"
+    slide = _add_slide(prs, prs.slide_layouts[0])
+    _set_title(slide, "Agentic AI Report", size=40)  # NEW: style + border
+
     session_title = entry.get("title") or (entry.get("prompt") or "")
     slide.placeholders[1].text = f"Session: {session_title}"
     created = entry.get("created_at") or entry.get("timestamp") or ""
@@ -2063,18 +2244,11 @@ def generate_ppt(entry) -> BytesIO:
         assistant_run = turn.get("assistant_run") or {}
 
         # 1) Slide for the user prompt
-        slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = f"Turn {idx}: User Prompt"
-        box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
-        tf = box.text_frame
-        tf.word_wrap = True
-        p = tf.paragraphs[0]
-        p.text = user_prompt
-        p.font.size = Pt(13)
-        if timestamp:
-            p = tf.add_paragraph()
-            p.text = f"⏱ {timestamp}"
-            p.font.size = Pt(10)
+        slide = _add_slide(prs, layout)
+        _set_title(slide, f"Turn {idx}: User Prompt")
+        tf = _add_text_block(slide)
+        _add_body_paragraph(tf, user_prompt, size=14, before=2, after=4)
+        _add_body_paragraph(tf, f"⏱ {timestamp}", size=10, before=2, after=4)
 
         # If assistant_run is empty, skip assistant slides
         if not assistant_run:
@@ -2084,8 +2258,8 @@ def generate_ppt(entry) -> BytesIO:
 
         # --- Document related (document route) ---
         if route == "document":
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Turn {idx}: Document Update Summary"
+            slide = _add_slide(prs, layout)
+            _set_title(slide, f"Turn {idx}: Document Update Summary")
 
             box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
             tf = box.text_frame
@@ -2126,16 +2300,22 @@ def generate_ppt(entry) -> BytesIO:
             if prev_rows:
                 _add_table_slide(prs, f"Turn {idx}: Matched Table (Preview)", prev_cols, prev_rows, max_rows=7)
 
+        # --- Comparison / General summaries ---
+        if assistant_run.get("comparison_summary"):
+            slide = _add_slide(prs, layout)
+            _set_title(slide, f"Turn {idx}: Comparison Summary")
+            tf = _add_text_block(slide)
+
+            for para in str(assistant_run.get("comparison_summary")).split("\n"):
+                if para.strip():
+                    _add_body_paragraph(tf, para.strip(), size=12, before=2, after=4)
+
         # --- SQL query slide ---
         if assistant_run.get("sql_query"):
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Turn {idx}: SQL Query"
-            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
-            tf = box.text_frame
-            tf.word_wrap = True
-            p = tf.paragraphs[0]
-            p.text = assistant_run.get("sql_query")
-            p.font.size = Pt(11)
+            slide = _add_slide(prs, layout)
+            _set_title(slide, f"Turn {idx}: SQL Query")
+            tf = _add_text_block(slide)
+            _add_body_paragraph(tf, assistant_run.get("sql_query"), size=14, before=2, after=4)            
 
         # --- SQL Result (if any) ---
         result = assistant_run.get("result")
@@ -2154,88 +2334,41 @@ def generate_ppt(entry) -> BytesIO:
             if rows:
                 _add_table_slide(prs, f"Turn {idx}: SQL Results", cols, rows, max_rows=6)
 
-        # --- Comparison / General summaries ---
-        if assistant_run.get("comparison_summary"):
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Turn {idx}: Comparison Summary"
-            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
-            tf = box.text_frame
-            tf.word_wrap = True
-            for para in str(assistant_run.get("comparison_summary")).split("\n"):
-                if para.strip():
-                    p = tf.add_paragraph()
-                    p.text = para.strip()
-                    p.font.size = Pt(12)
-
         if assistant_run.get("general_summary"):
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Turn {idx}: General Summary"
-            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
-            tf = box.text_frame
-            tf.word_wrap = True
+            slide = _add_slide(prs, layout)
+            _set_title(slide, f"Turn {idx}: General Summary")
+            tf = _add_text_block(slide)
             for para in str(assistant_run.get("general_summary")).split("\n"):
                 if para.strip():
-                    p = tf.add_paragraph()
-                    p.text = para.strip()
-                    p.font.size = Pt(12)
+                    _add_body_paragraph(tf, para.strip(), size=12, before=2, after=4)
 
         # --- Reconciliation slides (Two-Excel flow) ---
         if assistant_run.get("reconcile_df") or assistant_run.get("variance_commentary") or assistant_run.get("variance_summary"):
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Turn {idx}: Reconciliation Summary"
-
-            # Textbox for provenance and basic metadata
-            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.6))
-            tf = box.text_frame
-            tf.word_wrap = True
-
-            # Source files / timestamp
-            srcs = assistant_run.get("reconcile_source_files") or assistant_run.get("reconcile_source_files", [])
-            if srcs:
-                p = tf.paragraphs[0]
-                p.text = "Source files: " + ", ".join([os.path.basename(str(s)) for s in srcs])
-                p.font.size = Pt(11)
-            else:
-                p = tf.paragraphs[0]
-                p.text = f"Reconciliation run: {assistant_run.get('timestamp', '')}"
-                p.font.size = Pt(11)
 
             # Variance commentary slide (if present) — short narrative from LLM
             commentary = assistant_run.get("variance_commentary")
             if commentary:
-                slide = prs.slides.add_slide(layout)
-                slide.shapes.title.text = f"Turn {idx}: Variance Commentary"
-                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(3.5))
-                tf = box.text_frame
-                tf.word_wrap = True
+                slide = _add_slide(prs, layout)
+                _set_title(slide, f"Turn {idx}: Variance Commentary")
+                tf = _add_text_block(slide)
                 for para in str(commentary).split("\n"):
                     if para.strip():
-                        p = tf.add_paragraph()
-                        p.text = para.strip()
-                        p.font.size = Pt(12)
+                        _add_body_paragraph(tf, para.strip(), size=10, before=2, after=4)
 
             # Variance summary (key metrics) — render as compact JSON-like text
             summary = assistant_run.get("variance_summary")
             if summary:
-                slide = prs.slides.add_slide(layout)
-                slide.shapes.title.text = f"Turn {idx}: Variance Summary"
-                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(2.2))
-                tf = box.text_frame
-                tf.word_wrap = True
-                p = tf.paragraphs[0]
-                p.text = "Top summary metrics:"
-                p.font.size = Pt(12)
+                slide = _add_slide(prs, layout)
+                _set_title(slide, f"Turn {idx}: Variance Summary")
+                tf = _add_text_block(slide)
+                _add_body_paragraph(tf, "Top summary metrics:", size=12, before=2, after=4)
                 try:
                     # pretty-print top-level keys
                     summary_text = json.dumps(summary, indent=2)
-                    p = tf.add_paragraph()
-                    p.text = summary_text[:3000]  # clip to reasonable length
-                    p.level = 1
-                    p.font.size = Pt(10)
+                    _add_body_paragraph(tf, summary_text[:3000], size=12, before=2, after=4)
                 except Exception:
-                    p = tf.add_paragraph()
-                    p.text = str(summary)[:3000]
-                    p.font.size = Pt(10)
+                    _add_body_paragraph(tf, summary_text[:3000], size=12, before=2, after=4)
+
 
             # Main variance / reconciliation table: convert serialized forms as needed and add table slide
             recon = assistant_run.get("reconcile_df")
@@ -2257,15 +2390,11 @@ def generate_ppt(entry) -> BytesIO:
                             _add_table_slide(prs, f"Turn {idx}: Variance Table (top rows)", cols, rows, max_rows=6)
                 except Exception:
                     # safe fallback: include a short note if table could not be rendered
-                    slide = prs.slides.add_slide(layout)
-                    slide.shapes.title.text = f"Turn {idx}: Variance Table"
-                    box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.5))
-                    tf = box.text_frame
-                    tf.word_wrap = True
-                    p = tf.paragraphs[0]
-                    p.text = "Variance table present but could not be rendered in PPT. Please download the CSV from the session artifacts."
-                    p.font.size = Pt(11)
-            
+                    slide = _add_slide(prs, layout)
+                    _set_title(slide, f"Turn {idx}: Variance Table")
+                    tf = _add_text_block(slide)
+                    _add_body_paragraph(tf, "Variance table present but could not be rendered in PPT. Please download the CSV from the session artifacts.", size=12, before=2, after=4)
+
         # --- Missing combinations slides (if present) ---
         missing_a = assistant_run.get("missing_in_A")
         missing_b = assistant_run.get("missing_in_B")
@@ -2278,18 +2407,16 @@ def generate_ppt(entry) -> BytesIO:
                     _add_table_slide(prs, f"Turn {idx}: Missing in A (present in B) - top rows", cols_a, rows_a, max_rows=8)
                 else:
                     # If no rows after serialization, add a note slide
-                    slide = prs.slides.add_slide(layout)
-                    slide.shapes.title.text = f"Turn {idx}: Missing in A (present in B)"
-                    box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.0))
-                    tf = box.text_frame
-                    tf.text = "No example rows available for Missing-in-A."
+                    slide = _add_slide(prs, layout)
+                    _set_title(slide, f"Turn {idx}: Missing in A (present in B)")
+                    tf = _add_text_block(slide)
+                    _add_body_paragraph(tf, "No example rows available for Missing-in-A.", size=12, before=2, after=4)
+
             except Exception:
-                slide = prs.slides.add_slide(layout)
-                slide.shapes.title.text = f"Turn {idx}: Missing in A (present in B)"
-                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.5))
-                tf = box.text_frame
-                tf.word_wrap = True
-                tf.text = "Missing-in-A table present but could not be rendered. Please download the CSV from the session artifacts."
+                slide = _add_slide(prs, layout)
+                _set_title(slide, f"Turn {idx}: Missing in A (present in B)")
+                tf = _add_text_block(slide)
+                _add_body_paragraph(tf, "Missing-in-A table present but could not be rendered. Please download the CSV from the session artifacts.", size=12, before=2, after=4)
 
         # Missing in B (present in A)
         if missing_b:
@@ -2298,28 +2425,24 @@ def generate_ppt(entry) -> BytesIO:
                 if rows_b:
                     _add_table_slide(prs, f"Turn {idx}: Missing in B (present in A) - top rows", cols_b, rows_b, max_rows=8)
                 else:
-                    slide = prs.slides.add_slide(layout)
-                    slide.shapes.title.text = f"Turn {idx}: Missing in B (present in A)"
-                    box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.0))
-                    tf = box.text_frame
-                    tf.text = "No example rows available for Missing-in-B."
-            except Exception:
-                slide = prs.slides.add_slide(layout)
-                slide.shapes.title.text = f"Turn {idx}: Missing in B (present in A)"
-                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(1.5))
-                tf = box.text_frame
-                tf.word_wrap = True
-                tf.text = "Missing-in-B table present but could not be rendered. Please download the CSV from the session artifacts."
+                    slide = _add_slide(prs, layout)
+                    _set_title(slide, f"Turn {idx}: Missing in B (present in A)")
+                    tf = _add_text_block(slide)
+                    _add_body_paragraph(tf, "No example rows available for Missing-in-B.", size=12, before=2, after=4)                    
 
+            except Exception:
+                slide = _add_slide(prs, layout)
+                _set_title(slide, f"Turn {idx}: Missing in B (present in A)")    
+                tf = _add_text_block(slide)
+                _add_body_paragraph(tf, "Missing-in-B table present but could not be rendered. Please download the CSV from the session artifacts.", size=12, before=2, after=4)                            
 
         # --- Web links (search/comp) ---
         web_links = assistant_run.get("web_links") or assistant_run.get("result") if route == "search" else assistant_run.get("web_links")
         if web_links:
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Turn {idx}: Top Web Links"
-            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
-            tf = box.text_frame
-            tf.word_wrap = True
+            slide = _add_slide(prs, layout)
+            _set_title(slide, f"Turn {idx}: Top Web Links")
+            tf = _add_text_block(slide)
+
             for i, item in enumerate(web_links, 1):
                 # item could be tuple (markdown_link, summary) or simple string
                 link_md, summary = (item[0], item[1]) if (isinstance(item, (list, tuple)) and len(item) >= 2) else (str(item), "")
@@ -2338,6 +2461,7 @@ def generate_ppt(entry) -> BytesIO:
                 except Exception:
                     pass
                 if summary:
+                    # _add_body_paragraph(tf, f"    ↳ {str(summary)[:300]}", size=12, before=2, after=4)
                     s_p = tf.add_paragraph()
                     s_p.text = f"    ↳ {str(summary)[:300]}"
                     s_p.font.size = Pt(11)
@@ -2348,16 +2472,13 @@ def generate_ppt(entry) -> BytesIO:
         faiss_images = assistant_run.get("faiss_images") or assistant_run.get("faiss_images", [])
 
         if faiss_summary:
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Turn {idx}: FAISS Summary"
-            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
-            tf = box.text_frame
-            tf.word_wrap = True
+            slide = _add_slide(prs, layout)
+            _set_title(slide, f"Turn {idx}: FAISS Summary")
+            tf = _add_text_block(slide)
             for para in str(faiss_summary).split("\n"):
                 if para.strip():
-                    p = tf.add_paragraph()
-                    p.text = para.strip()
-                    p.font.size = Pt(12)
+                    _add_body_paragraph(tf, para.strip(), size=12, before=2, after=4)
+
 
         if faiss_sources:
             for i, src in enumerate(faiss_sources, 1):
@@ -2365,24 +2486,20 @@ def generate_ppt(entry) -> BytesIO:
                     docname, snippet, path = src[0], src[1], src[2] if len(src) >= 3 else (src[0], src[1], None)
                 except Exception:
                     docname, snippet, path = str(src), "", None
-                slide = prs.slides.add_slide(layout)
-                slide.shapes.title.text = f"Turn {idx}: FAISS Source {i} - {os.path.basename(path) if path else docname}"
-                box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
-                tf = box.text_frame
-                tf.word_wrap = True
+                slide = _add_slide(prs, layout)
+                _set_title(slide, f"Turn {idx}: FAISS Source {i} - {os.path.basename(path) if path else docname}")
+                tf = _add_text_block(slide)
                 for para in str(snippet).split("\n"):
                     if para.strip():
-                        p = tf.add_paragraph()
-                        p.text = para.strip()
-                        p.font.size = Pt(11)
+                        _add_body_paragraph(tf, para.strip(), size=12, before=2, after=4)
 
         if faiss_images and faiss_sources:
             # Only include images from the most-similar doc (first in faiss_sources)
             top_docname = faiss_sources[0][0] if isinstance(faiss_sources[0], (list, tuple)) else faiss_sources[0]
             top_images = [img for img in faiss_images if img.get("original_doc") == top_docname]
             if top_images:
-                slide = prs.slides.add_slide(prs.slide_layouts[5])
-                slide.shapes.title.text = f"Turn {idx}: Images from {top_docname}"
+                slide = _add_slide(prs, prs.slide_layouts[5])
+                _set_title(slide, f"Turn {idx}: Images from {top_docname}")
                 left = Inches(0.8)
                 top = Inches(2.2)
                 image_width = Inches(5.5)
@@ -2399,12 +2516,10 @@ def generate_ppt(entry) -> BytesIO:
         # --- Charts: if there is chart_info (you can expand how to render charts later) ---
         chart_info = assistant_run.get("chart_info")
         if chart_info:
-            slide = prs.slides.add_slide(layout)
-            slide.shapes.title.text = f"Turn {idx}: Chart Info"
-            box = slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9), Inches(4.5))
-            tf = box.text_frame
-            tf.word_wrap = True
-            tf.paragraphs[0].text = str(chart_info)[:1500]
+            slide = _add_slide(prs, layout)
+            _set_title(slide, f"Turn {idx}: Chart Info")
+            _add_body_paragraph(tf, str(chart_info)[:1500], size=12, before=2, after=4)
+            tf = _add_text_block(slide)
 
     # End: return PPT as BytesIO
     ppt_bytes = BytesIO()
@@ -2564,19 +2679,6 @@ def _render_run_by_route(run):
             st.subheader("📄 Document Update (turn)")
             _render_document_block(run)
 
-        # SQL Query Result
-        if run.get("sql_query"):
-            st.subheader("🧾 SQL Query:")
-            st.code(run["sql_query"], language="sql")
-
-            st.subheader("SQL Query Result:")
-            result_df = run.get("result")
-            formatted = _format_dataframe_for_display(result_df)
-            if isinstance(formatted, pd.DataFrame):
-                st.dataframe(formatted)
-            else:
-                st.text(formatted if formatted is not None else "_No result returned_")
-
         # For comparison runs, show summaries and web links if present
         if route == "comp":
              # If reconciliation outputs exist (two-excel flow), show those first
@@ -2680,6 +2782,9 @@ def _render_run_by_route(run):
                 
             #SQL vs WEB
             else:
+                if run.get("comparison_summary"):
+                    st.subheader("🆚 Comparison Summary:")
+                    st.markdown(run["comparison_summary"])
                 if run.get("general_summary"):
                     st.subheader("🧠 General Summary:")
                     st.markdown(run["general_summary"])
@@ -2687,9 +2792,21 @@ def _render_run_by_route(run):
                 for i, (link, summary) in enumerate(run.get("web_links") or [], 1):
                     st.markdown(f"**{i}.** {link}")
                     st.markdown(f"_Summary:_\n{summary}")
-                if run.get("comparison_summary"):
-                    st.subheader("🆚 Comparison Summary:")
-                    st.markdown(run["comparison_summary"])
+
+
+        
+        # SQL Query Result
+        if run.get("sql_query"):
+            st.subheader("🧾 SQL Query:")
+            st.code(run["sql_query"], language="sql")
+
+            st.subheader("SQL Query Result:")
+            result_df = run.get("result")
+            formatted = _format_dataframe_for_display(result_df)
+            if isinstance(formatted, pd.DataFrame):
+                st.dataframe(formatted)
+            else:
+                st.text(formatted if formatted is not None else "_No result returned_")
 
     elif route == "faissdb":
         # faissdb runs may be stored within a run or (for older entries) at the top-level entry.
@@ -2755,7 +2872,7 @@ graph_builder.add_edge("faissdb", END)
 agent_graph = graph_builder.compile()
 
 # ---- Streamlit UI ----
-st.title("\U0001F9E0 Agentic AI Assistant (Insurance)")
+st.title("\U0001F9E0 Project ASTRA")
 
 
 def format_date_label(chat_date: date) -> str:
@@ -3387,7 +3504,7 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
             # Support two stored formats:
             # 1) new format: {"role":"turn","user_prompt":..., "assistant_run": run_record, "timestamp":...}
             # 2) older format: {"role":"user","text": "..."} or similar
-            user_prompt = turn.get("user_prompt")
+            user_prompt = turn.get("user_prompt") or turn.get("text") or turn.get("prompt")
             timestamp = turn.get("timestamp") or turn.get("assistant_run", {}).get("timestamp") or ""
             st.markdown(f"**{idx}. You:** {user_prompt}")
             if timestamp:
@@ -3417,5 +3534,3 @@ if st.session_state.active_chat_index is not None and not st.session_state.just_
 
     else:
         st.text("Message not found")
-
-
